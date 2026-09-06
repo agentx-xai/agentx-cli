@@ -22,11 +22,11 @@ agentx agent sync --device "$AGENTX_DEVICE_ID"
 
 完整产品说明见 [`PRODUCT.md`](PRODUCT.md)。
 
-声明式管理 Codex、Claude Code、Cursor、Windsurf、Gemini CLI、GitHub Copilot 和 Cline 的 Skills 与工作环境。
+声明式管理 Codex、Claude Code、Cursor、Windsurf、Gemini CLI、GitHub Copilot、Cline 和 Grok Build 的 Skills 与工作环境。
 
 ## 当前状态
 
-Rust CLI 已实现本地 Skill 生命周期、七类 Agent 的 Rules 和 MCP 配置适配，以及 Registry `login`、`publish`、`pull`；通过 `--workspace` 使用 workspace scoped Registry，`team pull`/`team push` 可同步 workspace 团队 manifest。Go API 提供 workspace/membership、策略执行、版本化 manifest、Registry、审计、Drift、设备 heartbeat、cursor 分页和 scoped artifact 下载；Vue 3 控制台支持 workspace、成员角色、manifest、策略、Registry、设备、Drift 和 Audit 操作。
+Rust CLI 已实现本地 Skill 生命周期、八类 Agent 的 Rules 和 MCP 配置适配，以及 Registry `login`、`publish`、`pull`；通过 `--workspace` 使用 workspace scoped Registry，`team pull`/`team push` 可同步 workspace 团队 manifest。Go API 提供 workspace/membership、策略执行、版本化 manifest、Registry、审计、Drift、设备 heartbeat、cursor 分页和 scoped artifact 下载；Vue 3 控制台支持 workspace、成员角色、manifest、策略、Registry、设备、Drift 和 Audit 操作。
 
 ```bash
 cd cli
@@ -57,6 +57,7 @@ agentx install --target cline --yes --frozen
 | `gemini` | `GEMINI.md` | `.gemini/skills` | `.gemini/settings.json` |
 | `copilot` | `.github/copilot-instructions.md` | `.github/skills` | `~/.copilot/mcp-config.json` |
 | `cline` | `.clinerules/agentx.md` | `.cline/skills` | `.cline/mcp_settings.json` |
+| `grok` | `.grok/rules/agentx.md` | `.grok/skills` | `.grok/config.toml` |
 
 CLI 远程凭据保存在用户配置目录，拉取时会重新校验 SHA-256。服务端可使用 PostgreSQL、API token、HMAC JWT 或配置 `AGENTX_OIDC_ISSUER` 启用 OIDC discovery/JWKS 验证，并支持 Ed25519 artifact 签名验证。
 

@@ -44,7 +44,7 @@ fn install_compiles_all_supported_target_formats() {
     .unwrap();
 
     for target in [
-        "codex", "claude", "cursor", "windsurf", "gemini", "copilot", "cline",
+        "codex", "claude", "cursor", "windsurf", "gemini", "copilot", "cline", "grok",
     ] {
         install(&project, &home, target);
     }
@@ -57,6 +57,7 @@ fn install_compiles_all_supported_target_formats() {
         project.join("GEMINI.md"),
         project.join(".github/copilot-instructions.md"),
         project.join(".clinerules/agentx.md"),
+        project.join(".grok/rules/agentx.md"),
     ];
     for path in expected {
         assert!(
@@ -74,6 +75,7 @@ fn install_compiles_all_supported_target_formats() {
         project.join(".gemini/skills/demo/SKILL.md"),
         project.join(".github/skills/demo/SKILL.md"),
         project.join(".cline/skills/demo/SKILL.md"),
+        project.join(".grok/skills/demo/SKILL.md"),
     ] {
         assert!(
             path.is_file(),
@@ -90,6 +92,7 @@ fn install_compiles_all_supported_target_formats() {
         project.join(".gemini/settings.json"),
         home.join(".copilot/mcp-config.json"),
         project.join(".cline/mcp_settings.json"),
+        project.join(".grok/config.toml"),
     ] {
         assert!(
             path.is_file(),

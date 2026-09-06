@@ -688,6 +688,7 @@ fn target_root(target: &str) -> Result<PathBuf> {
         "gemini" => Ok(root()?.join(".gemini/skills")),
         "copilot" => Ok(root()?.join(".github/skills")),
         "cline" => Ok(root()?.join(".cline/skills")),
+        "grok" => Ok(root()?.join(".grok/skills")),
         _ => bail!(
             "unsupported target {target}; use {}",
             SUPPORTED_TARGETS.join(", ")
@@ -850,6 +851,7 @@ fn install_mcp(m: &Manifest, target: &str) -> Result<()> {
             &selected,
             "mcpServers",
         )?,
+        "grok" => install_grok_mcp(&selected)?,
         _ => {}
     }
     Ok(())
@@ -938,6 +940,33 @@ fn install_json_mcp(path: &Path, selected: &[&Mcp], key: &str) -> Result<()> {
     write_atomic(path, serde_json::to_vec_pretty(&document)?.as_slice())
 }
 
+fn install_grok_mcp(selected: &[&Mcp]) -> Result<()> {
+    let path = root()?.join(".grok/config.toml");
+    let mut document = if path.exists() {
+        toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let root = document
+        .as_table_mut()
+        .context("Grok config must be a TOML table")?;
+    let servers = root
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("Grok mcp_servers must be a TOML table")?;
+    for mcp in selected {
+        let mut entry = toml::map::Map::new();
+        entry.insert("command".into(), toml::Value::String(mcp.command.clone()));
+        entry.insert(
+            "args".into(),
+            toml::Value::Array(mcp.args.iter().cloned().map(toml::Value::String).collect()),
+        );
+        servers.insert(mcp.name.clone(), toml::Value::Table(entry));
+    }
+    write_atomic(&path, toml::to_string_pretty(&document)?.as_bytes())
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1008,6 +1037,7 @@ fn install_rules(m: &Manifest, target: &str) -> Result<()> {
             text.as_bytes(),
         )?,
         "cline" => write_atomic(&root()?.join(".clinerules/agentx.md"), text.as_bytes())?,
+        "grok" => write_atomic(&root()?.join(".grok/rules/agentx.md"), text.as_bytes())?,
         _ => bail!("unsupported target {target}"),
     }
     Ok(())
