@@ -1,0 +1,8 @@
+/target/
+*.agentx-backup/
+.DS_Store
+.env
+.env.*
+!.env.example
+credentials.json
+agentx-data/
