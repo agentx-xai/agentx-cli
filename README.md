@@ -46,6 +46,18 @@ agentx install --target cline --yes --frozen
 
 省略 `--target` 时保持向后兼容，只安装 Codex 和 Claude Code。
 
+支持的 target 和生成位置：
+
+| Target | Rules | Skills | MCP |
+| --- | --- | --- | --- |
+| `codex` | `AGENTS.md` | `~/.codex/skills` | `~/.codex/config.toml` |
+| `claude` | `CLAUDE.md` | `~/.claude/skills` | `~/.claude.json` |
+| `cursor` | `.cursor/rules/agentx.mdc` | `.cursor/skills` | `.cursor/mcp.json` |
+| `windsurf` | `.windsurf/rules/agentx.md` | `.windsurf/skills` | `.windsurf/mcp_config.json` |
+| `gemini` | `GEMINI.md` | `.gemini/skills` | `.gemini/settings.json` |
+| `copilot` | `.github/copilot-instructions.md` | `.github/skills` | `~/.copilot/mcp-config.json` |
+| `cline` | `.clinerules/agentx.md` | `.cline/skills` | `.cline/mcp_settings.json` |
+
 CLI 远程凭据保存在用户配置目录，拉取时会重新校验 SHA-256。服务端可使用 PostgreSQL、API token、HMAC JWT 或配置 `AGENTX_OIDC_ISSUER` 启用 OIDC discovery/JWKS 验证，并支持 Ed25519 artifact 签名验证。
 
 ## 服务端
