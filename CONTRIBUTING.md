@@ -1,16 +1,13 @@
-# Contributing
+# Contributing to AgentX CLI
 
-## Development
+Use the [organization contribution guide](https://github.com/agentx-xai/.github/blob/main/CONTRIBUTING.md) for the shared review and security rules.
+
+## Local checks
 
 ```bash
-make test
-make build
+cargo fmt --manifest-path Cargo.toml -- --check
+cargo test --manifest-path Cargo.toml
+cargo build --manifest-path Cargo.toml --release
 ```
 
-Rust code lives in `cli/`, Go code in `server/`, Vue code in `web/`, and reusable Agent context in `skills/`.
-
-Keep adapters target-specific, do not copy credentials or sessions, and update `agentx-progress` when a planned capability changes state. New API routes must be documented in `server/openapi.yaml` and covered by tests.
-
-## Pull requests
-
-Describe the user-visible behavior, security implications, migration needs, and verification commands. Keep changes focused and preserve backward compatibility for manifest and lockfile formats.
+Adapter changes should include target-specific tests. Do not copy credentials, sessions, caches, or generated build output into a package. Changes to Manifest or lockfile behavior must document compatibility impact in the pull request.

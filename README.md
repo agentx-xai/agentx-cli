@@ -1,5 +1,15 @@
 # AgentX CLI
 
+<p align="center"><img src="https://raw.githubusercontent.com/agentx-xai/.github/main/profile/agentx-mark.svg" alt="AgentX" width="88"></p>
+
+<p align="center">
+  <a href="https://github.com/agentx-xai/agentx-cli/actions/workflows/ci.yml"><img src="https://github.com/agentx-xai/agentx-cli/actions/workflows/ci.yml/badge.svg" alt="CLI CI"></a>
+  <a href="https://github.com/agentx-xai/agentx-cli/releases"><img src="https://img.shields.io/github/v/release/agentx-xai/agentx-cli" alt="Latest release"></a>
+  <a href="https://github.com/agentx-xai/agentx-cli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/agentx-xai/agentx-cli" alt="MIT license"></a>
+</p>
+
+<p align="center">将一份声明式 Manifest 编译为多个 AI Agent 的可复现开发环境。</p>
+
 本仓库是 AgentX 的本地环境管理 CLI。它负责 Manifest、Lockfile、Skills、Rules、MCP 配置、Registry 登录，以及设备同步和回滚。
 
 ## 快速开始
@@ -20,7 +30,7 @@ agentx agent plan --device "$AGENTX_DEVICE_ID"
 agentx agent sync --device "$AGENTX_DEVICE_ID"
 ```
 
-完整产品说明见 [`PRODUCT.md`](PRODUCT.md)。
+完整产品说明见 [`PRODUCT.md`](PRODUCT.md)。组织主页、贡献指南和安全政策见 [AgentX GitHub Organization](https://github.com/agentx-xai)。
 
 声明式管理 Codex、Claude Code、Cursor、Windsurf、Gemini CLI、GitHub Copilot、Cline 和 Grok Build 的 Skills 与工作环境。
 
@@ -71,7 +81,7 @@ cd server
 AGENTX_DATA_DIR=../data go run ./cmd/app
 ```
 
-API 文档见 [`server/openapi.yaml`](server/openapi.yaml)，本地单节点部署见 [`docker-compose.yml`](docker-compose.yml)。开源贡献规则见 [`CONTRIBUTING.md`](CONTRIBUTING.md)，安全问题见 [`SECURITY.md`](SECURITY.md)。
+Registry API 文档见 [agentx-server/openapi.yaml](https://github.com/agentx-xai/agentx-server/blob/main/openapi.yaml)，本地部署和服务端实现见 [agentx-server](https://github.com/agentx-xai/agentx-server)。开源贡献规则见 [`CONTRIBUTING.md`](CONTRIBUTING.md)，安全问题见 [`SECURITY.md`](SECURITY.md)。
 
 可选依赖使用本机已有镜像启动：`docker compose --profile cache up -d`，或 `docker compose --profile object-store up -d`。默认 API 不依赖 Redis/MinIO。
 
