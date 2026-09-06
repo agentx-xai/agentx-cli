@@ -1,3 +1,4 @@
+use crate::interface::SUPPORTED_TARGETS;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use directories::BaseDirs;
@@ -682,7 +683,15 @@ fn target_root(target: &str) -> Result<PathBuf> {
     match target {
         "codex" => Ok(home.join(".codex/skills")),
         "claude" => Ok(home.join(".claude/skills")),
-        _ => bail!("unsupported target {target}; use codex or claude"),
+        "cursor" => Ok(root()?.join(".cursor/skills")),
+        "windsurf" => Ok(root()?.join(".windsurf/skills")),
+        "gemini" => Ok(root()?.join(".gemini/skills")),
+        "copilot" => Ok(root()?.join(".github/skills")),
+        "cline" => Ok(root()?.join(".cline/skills")),
+        _ => bail!(
+            "unsupported target {target}; use {}",
+            SUPPORTED_TARGETS.join(", ")
+        ),
     }
 }
 fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
@@ -690,6 +699,14 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
     let targets = target
         .map(|x| vec![x.to_string()])
         .unwrap_or_else(|| vec!["codex".into(), "claude".into()]);
+    for target in &targets {
+        if !SUPPORTED_TARGETS.contains(&target.as_str()) {
+            bail!(
+                "unsupported target {target}; use {}",
+                SUPPORTED_TARGETS.join(", ")
+            );
+        }
+    }
     let mut lock = Lock {
         version: 1,
         packages: Vec::new(),
@@ -812,9 +829,37 @@ fn install_mcp(m: &Manifest, target: &str) -> Result<()> {
     match target {
         "codex" => install_codex_mcp(&selected)?,
         "claude" => install_claude_mcp(&selected)?,
+        "cursor" => install_json_mcp(&root()?.join(".cursor/mcp.json"), &selected, "mcpServers")?,
+        "windsurf" => install_json_mcp(
+            &root()?.join(".windsurf/mcp_config.json"),
+            &selected,
+            "mcpServers",
+        )?,
+        "gemini" => install_json_mcp(
+            &root()?.join(".gemini/settings.json"),
+            &selected,
+            "mcpServers",
+        )?,
+        "copilot" => install_json_mcp(
+            &dirs_home()?.join(".copilot/mcp-config.json"),
+            &selected,
+            "mcpServers",
+        )?,
+        "cline" => install_json_mcp(
+            &root()?.join(".cline/mcp_settings.json"),
+            &selected,
+            "mcpServers",
+        )?,
         _ => {}
     }
     Ok(())
+}
+
+fn dirs_home() -> Result<PathBuf> {
+    Ok(BaseDirs::new()
+        .context("cannot find home directory")?
+        .home_dir()
+        .to_path_buf())
 }
 
 fn install_codex_mcp(selected: &[&Mcp]) -> Result<()> {
@@ -870,6 +915,29 @@ fn install_claude_mcp(selected: &[&Mcp]) -> Result<()> {
     write_atomic(&path, serde_json::to_vec_pretty(&document)?.as_slice())
 }
 
+fn install_json_mcp(path: &Path, selected: &[&Mcp], key: &str) -> Result<()> {
+    let mut document = if path.exists() {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path)?)?
+    } else {
+        serde_json::json!({})
+    };
+    let root = document
+        .as_object_mut()
+        .context("MCP config must be a JSON object")?;
+    let servers = root
+        .entry(key)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("MCP server collection must be a JSON object")?;
+    for mcp in selected {
+        servers.insert(
+            mcp.name.clone(),
+            serde_json::json!({"command": mcp.command, "args": mcp.args}),
+        );
+    }
+    write_atomic(path, serde_json::to_vec_pretty(&document)?.as_slice())
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -881,7 +949,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn rollback() -> Result<()> {
     let mut restored = 0;
-    for target in ["codex", "claude"] {
+    for target in SUPPORTED_TARGETS {
         let root = target_root(target)?;
         if !root.exists() {
             continue;
@@ -913,12 +981,35 @@ fn install_rules(m: &Manifest, target: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    let filename = if target == "codex" {
-        "AGENTS.md"
-    } else {
-        "CLAUDE.md"
-    };
-    fs::write(root()?.join(filename), text)?;
+    match target {
+        "codex" | "claude" => {
+            let filename = if target == "codex" {
+                "AGENTS.md"
+            } else {
+                "CLAUDE.md"
+            };
+            fs::write(root()?.join(filename), text)?;
+        }
+        "cursor" => {
+            let dir = root()?.join(".cursor/rules");
+            fs::create_dir_all(&dir)?;
+            write_atomic(
+                &dir.join("agentx.mdc"),
+                format!(
+                    "---\ndescription: AgentX managed project rules\nalwaysApply: true\n---\n\n{text}"
+                )
+                .as_bytes(),
+            )?;
+        }
+        "windsurf" => write_atomic(&root()?.join(".windsurf/rules/agentx.md"), text.as_bytes())?,
+        "gemini" => write_atomic(&root()?.join("GEMINI.md"), text.as_bytes())?,
+        "copilot" => write_atomic(
+            &root()?.join(".github/copilot-instructions.md"),
+            text.as_bytes(),
+        )?,
+        "cline" => write_atomic(&root()?.join(".clinerules/agentx.md"), text.as_bytes())?,
+        _ => bail!("unsupported target {target}"),
+    }
     Ok(())
 }
 fn security_scan(path: &Path) -> Result<()> {
@@ -952,7 +1043,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 }
 fn diff() -> Result<()> {
     let m = load_manifest()?;
-    for target in ["codex", "claude"] {
+    for target in SUPPORTED_TARGETS {
         let dest = target_root(target)?;
         for skill in &m.skills {
             let expected = sha256_dir(&source_path(&skill.source)?)?;
@@ -972,14 +1063,25 @@ fn diff() -> Result<()> {
     Ok(())
 }
 fn doctor() -> Result<()> {
-    for target in ["codex", "claude"] {
+    for target in SUPPORTED_TARGETS {
         let bin = target;
         let found = std::process::Command::new("sh")
             .args(["-lc", &format!("command -v {bin}")])
             .output()?
             .status
             .success();
-        println!("{target}: {}", if found { "detected" } else { "not found" });
+        let configured = target_root(target)?
+            .parent()
+            .map(Path::exists)
+            .unwrap_or(false);
+        println!(
+            "{target}: {}",
+            if found || configured {
+                "detected"
+            } else {
+                "not found"
+            }
+        );
         println!("  skills dir: {}", target_root(target)?.display());
     }
     Ok(())
@@ -1009,5 +1111,48 @@ mod tests {
         fs::write(&file, vec![0_u8; 2_000_001]).unwrap();
         assert!(security_scan(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn all_supported_targets_have_distinct_skill_roots() {
+        let roots: Vec<_> = SUPPORTED_TARGETS
+            .iter()
+            .map(|target| target_root(target).unwrap())
+            .collect();
+        for (index, root) in roots.iter().enumerate() {
+            assert!(
+                root.ends_with("skills"),
+                "unexpected root: {}",
+                root.display()
+            );
+            assert!(
+                roots.iter().skip(index + 1).all(|other| other != root),
+                "duplicate root: {}",
+                root.display()
+            );
+        }
+    }
+
+    #[test]
+    fn json_mcp_adapter_preserves_existing_servers() {
+        let path = std::env::temp_dir().join(format!("agentx-mcp-{}.json", std::process::id()));
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"command":"keep"}},"other":true}"#,
+        )
+        .unwrap();
+        let mcp = Mcp {
+            name: "docs".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "docs-mcp".into()],
+            targets: vec![],
+        };
+        install_json_mcp(&path, &[&mcp], "mcpServers").unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["other"], true);
+        assert_eq!(value["mcpServers"]["existing"]["command"], "keep");
+        assert_eq!(value["mcpServers"]["docs"]["command"], "npx");
+        fs::remove_file(path).unwrap();
     }
 }

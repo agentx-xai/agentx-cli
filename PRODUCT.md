@@ -12,7 +12,7 @@ AgentX 解决的是“换一台机器后，如何恢复同一套 Agent 环境”
 - **Registry API**：保存团队 Workspace、成员、Manifest、不可变 Artifact、设备状态和审计记录。
 - **Web Console**：管理 Workspace、成员、Registry、Manifest、策略、设备和 Drift。
 
-当前优先支持 Codex 和 Claude Code。Cursor、Copilot 等适配器不属于当前稳定能力范围。
+当前 CLI 已支持 Codex、Claude Code、Cursor、Windsurf、Gemini CLI、GitHub Copilot 和 Cline。每个 target 会把同一份 Manifest 编译为对应的 Rules、Skills 和 MCP 配置格式；不复制登录会话、API Key 或缓存。
 
 ## 2. 核心概念
 
@@ -38,7 +38,7 @@ mcp:
     targets: [codex]
 ```
 
-`skills` 可以来自本地目录或固定 Git ref。`rules` 会生成 `AGENTS.md` 或 `CLAUDE.md`，`mcp` 会写入对应 Agent 的 MCP 配置。
+`skills` 可以来自本地目录或固定 Git ref。`rules` 和 `mcp` 会按 target 生成对应 Agent 的文件：Cursor 使用 `.cursor/rules/*.mdc` 与 `.cursor/mcp.json`，Windsurf 使用 `.windsurf/rules` 与 `.windsurf/mcp_config.json`，Gemini CLI 使用 `GEMINI.md`、`.gemini/skills` 与 `.gemini/settings.json`，Copilot 使用 `.github/copilot-instructions.md`，Cline 使用 `.clinerules`、`.cline/skills` 与 `.cline/mcp_settings.json`。
 
 ### Lockfile
 
@@ -433,4 +433,3 @@ agentx install --yes --frozen
 ### 如何判断服务是否适合上线
 
 至少完成一次 staging 验收、Artifact 下载校验、备份恢复、OIDC JWKS 轮换和第二台设备同步回滚演练，再根据真实试用反馈决定计费、通知和新的 Agent adapter。
-
