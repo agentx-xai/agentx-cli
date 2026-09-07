@@ -66,11 +66,13 @@ agentx install --target grok --yes --frozen
 | `codex` | `AGENTS.md` | `~/.codex/skills` | `~/.codex/config.toml` |
 | `claude` | `CLAUDE.md` (managed block) | `~/.claude/skills` | `.mcp.json` |
 | `cursor` | `.cursor/rules/agentx.mdc` | `.cursor/skills` | `.cursor/mcp.json` |
-| `windsurf` | `.windsurf/rules/agentx.md` | `.windsurf/skills` | `.windsurf/mcp_config.json` |
+| `windsurf` | `.windsurf/rules/agentx.md` | `.windsurf/skills` | `~/.codeium/windsurf/mcp_config.json` |
 | `gemini` | `GEMINI.md` | `.gemini/skills` | `.gemini/settings.json` |
 | `copilot` | `.github/copilot-instructions.md` | `.github/skills` | `~/.copilot/mcp-config.json` |
-| `cline` | `.clinerules/agentx.md` | `.cline/skills` | `.cline/mcp_settings.json` |
+| `cline` | `.clinerules/agentx.md` | `.cline/skills` | `~/.cline/mcp.json` |
 | `grok` | `.grok/rules/agentx.md` | `.grok/skills` | `.grok/config.toml` (`[mcp_servers.<name>]`) |
+
+交互式安装会先显示每个 Skill 和 Rules 的目标位置，以及 MCP 的命令、完整参数、检测到的环境变量引用和配置路径。Skill 安全扫描会拒绝符号链接、超过 2 MiB 的文件、凭据/私钥文件名，以及原生或非预期可执行文件。Git Skill source 必须提供固定 `ref`。
 
 推送形如 `v0.1.2` 的 Tag 会触发 `.github/workflows/release.yml`，先运行格式检查、测试和 release 构建，再创建 GitHub Release 并上传 Linux CLI 压缩包和 SHA-256 校验和。Tag 可通过 GitHub Actions 的 `Tag` workflow 从指定分支创建。
 

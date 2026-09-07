@@ -29,13 +29,16 @@ Without `--target`, the backwards-compatible default installs Codex and Claude C
 | `codex` | project `AGENTS.md` managed block | `~/.codex/skills` | `~/.codex/config.toml` |
 | `claude` | project `CLAUDE.md` managed block | `~/.claude/skills` | project `.mcp.json` |
 | `cursor` | `.cursor/rules/agentx.mdc` | `.cursor/skills` | `.cursor/mcp.json` |
-| `windsurf` | `.windsurf/rules/agentx.md` | `.windsurf/skills` | `.windsurf/mcp_config.json` |
+| `windsurf` | `.windsurf/rules/agentx.md` | `.windsurf/skills` | `~/.codeium/windsurf/mcp_config.json` |
 | `gemini` | `GEMINI.md` | `.gemini/skills` | `.gemini/settings.json` |
 | `copilot` | `.github/copilot-instructions.md` | `.github/skills` | `~/.copilot/mcp-config.json` |
-| `cline` | `.clinerules/agentx.md` | `.cline/skills` | `.cline/mcp_settings.json` |
+| `cline` | `.clinerules/agentx.md` | `.cline/skills` | `~/.cline/mcp.json` |
 | `grok` | `.grok/rules/agentx.md` | `.grok/skills` | `.grok/config.toml`, `[mcp_servers.<name>]` |
 
 Codex and Claude rules preserve user content outside AgentX managed markers. Existing JSON/TOML configuration is preserved and only the declared server entries are updated. The current manifest format supports MCP `command` and `args`; URL, headers, and environment-specific transports are intentionally not synthesized.
+
+Git Skill sources must specify a fixed `ref` so that the lockfile remains reproducible.
+Before an interactive install, the plan shows every Skill and Rules destination plus each MCP command, argument list, detected environment reference, and configuration path. The Skill scanner rejects symlinks, files above 2 MiB, credential/private-key names, and native or unexpected executable payloads.
 
 ## Registry and devices
 

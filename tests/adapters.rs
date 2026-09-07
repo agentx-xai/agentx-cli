@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,39 @@ fn temp_dir(label: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn install_plan_discloses_commands_arguments_and_target_paths() {
+    let project = temp_dir("plan-project");
+    let home = temp_dir("plan-home");
+    fs::create_dir_all(project.join("skills/demo")).unwrap();
+    fs::write(project.join("skills/demo/SKILL.md"), "# Demo\n").unwrap();
+    fs::write(
+        project.join("agentx.yaml"),
+        "version: 1\nskills:\n  - name: demo\n    source: { type: local, path: skills/demo }\nmcp:\n  - name: docs\n    command: sh\n    args: [\"-lc\", \"docs --token $DOCS_TOKEN\"]\n    targets: [codex]\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentx"))
+        .args(["install", "--target", "codex"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("command \"sh\"; args [\"-lc\", \"docs --token $DOCS_TOKEN\"]"));
+    assert!(stdout.contains("environment refs [DOCS_TOKEN]"));
+    assert!(stdout.contains(&home.join(".codex/config.toml").display().to_string()));
+    assert!(stdout.contains(&home.join(".codex/skills/demo").display().to_string()));
+
+    fs::remove_dir_all(project).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
 fn install(project: &Path, home: &Path, target: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
         .args(["install", "--target", target, "--yes"])
@@ -25,6 +59,20 @@ fn install(project: &Path, home: &Path, target: &str) {
     assert!(
         output.status.success(),
         "target {target} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn rollback(project: &Path, home: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
+        .arg("rollback")
+        .current_dir(project)
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rollback failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -94,10 +142,10 @@ fn install_compiles_all_supported_target_formats() {
         home.join(".codex/config.toml"),
         project.join(".mcp.json"),
         project.join(".cursor/mcp.json"),
-        project.join(".windsurf/mcp_config.json"),
+        home.join(".codeium/windsurf/mcp_config.json"),
         project.join(".gemini/settings.json"),
         home.join(".copilot/mcp-config.json"),
-        project.join(".cline/mcp_settings.json"),
+        home.join(".cline/mcp.json"),
         project.join(".grok/config.toml"),
     ] {
         assert!(
@@ -120,6 +168,22 @@ fn install_compiles_all_supported_target_formats() {
         grok_config["mcp_servers"]["docs"]["args"][0].as_str(),
         Some("-y")
     );
+
+    rollback(&project, &home);
+    for path in [
+        project.join("AGENTS.md"),
+        project.join("CLAUDE.md"),
+        project.join(".mcp.json"),
+        home.join(".codex/config.toml"),
+        home.join(".codeium/windsurf/mcp_config.json"),
+        home.join(".cline/mcp.json"),
+    ] {
+        assert!(
+            !path.exists(),
+            "rollback left generated path: {}",
+            path.display()
+        );
+    }
 
     fs::remove_dir_all(project).unwrap();
     fs::remove_dir_all(home).unwrap();

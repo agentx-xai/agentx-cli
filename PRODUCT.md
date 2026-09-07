@@ -40,7 +40,7 @@ mcp:
     targets: [codex]
 ```
 
-`skills` 可以来自本地目录或固定 Git ref。`rules` 和 `mcp` 会按 target 生成对应 Agent 的文件：Codex 使用 `AGENTS.md` 中的受管区块、`~/.codex/skills` 与 `~/.codex/config.toml`；Claude Code 使用 `CLAUDE.md` 中的受管区块、`~/.claude/skills` 与项目 `.mcp.json`；Cursor 使用 `.cursor/rules/*.mdc` 与 `.cursor/mcp.json`；Windsurf 使用 `.windsurf/rules` 与 `.windsurf/mcp_config.json`；Gemini CLI 使用 `GEMINI.md`、`.gemini/skills` 与 `.gemini/settings.json`；Copilot 使用 `.github/copilot-instructions.md`、`.github/skills` 与 `~/.copilot/mcp-config.json`；Cline 使用 `.clinerules`、`.cline/skills` 与 `.cline/mcp_settings.json`；Grok Build 使用项目级 `.grok/rules/*.md`、`.grok/skills/<name>/SKILL.md` 与 `.grok/config.toml` 中的 `[mcp_servers.<name>]`。Codex 和 Claude 的规则会保留现有文件内容，只更新 AgentX 受管区块。
+`skills` 可以来自本地目录或固定 Git ref。`rules` 和 `mcp` 会按 target 生成对应 Agent 的文件：Codex 使用 `AGENTS.md` 中的受管区块、`~/.codex/skills` 与 `~/.codex/config.toml`；Claude Code 使用 `CLAUDE.md` 中的受管区块、`~/.claude/skills` 与项目 `.mcp.json`；Cursor 使用 `.cursor/rules/*.mdc` 与 `.cursor/mcp.json`；Windsurf 使用 `.windsurf/rules`、`.windsurf/skills` 与 `~/.codeium/windsurf/mcp_config.json`；Gemini CLI 使用 `GEMINI.md`、`.gemini/skills` 与 `.gemini/settings.json`；Copilot 使用 `.github/copilot-instructions.md`、`.github/skills` 与 `~/.copilot/mcp-config.json`；Cline 使用 `.clinerules`、`.cline/skills` 与 `~/.cline/mcp.json`；Grok Build 使用项目级 `.grok/rules/*.md`、`.grok/skills/<name>/SKILL.md` 与 `.grok/config.toml` 中的 `[mcp_servers.<name>]`。Codex 和 Claude 的规则会保留现有文件内容，只更新 AgentX 受管区块。交互式安装计划会展示所有目标路径以及 MCP 命令、完整参数和检测到的环境变量引用；安全扫描会拒绝符号链接、超过 2 MiB 的文件、凭据/私钥文件名和原生或非预期可执行文件。
 
 ### Lockfile
 

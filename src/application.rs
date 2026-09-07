@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -624,45 +625,41 @@ fn source_path(source: &Source) -> Result<PathBuf> {
             Ok(p)
         }
         Source::Git { url, r#ref } => {
-            if let Some(reference) = r#ref {
-                let mut key = Sha256::new();
-                key.update(url.as_bytes());
-                key.update([0]);
-                key.update(reference.as_bytes());
-                let cache = root()?
-                    .join(".agentx/cache/git")
-                    .join(format!("{:x}", key.finalize()));
-                if cache.is_dir() {
-                    return Ok(cache);
+            let reference = r#ref
+                .as_deref()
+                .context("git skill sources require a fixed ref")?;
+            let mut key = Sha256::new();
+            key.update(url.as_bytes());
+            key.update([0]);
+            key.update(reference.as_bytes());
+            let cache = root()?
+                .join(".agentx/cache/git")
+                .join(format!("{:x}", key.finalize()));
+            if cache.is_dir() {
+                let metadata = cache.join(".git");
+                if metadata.exists() {
+                    remove_path(&metadata)?;
                 }
-                let parent = cache.parent().context("invalid git cache path")?;
-                fs::create_dir_all(parent)?;
-                let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-                let temp = parent.join(format!("clone-{stamp}"));
-                let mut cmd = Command::new("git");
-                cmd.args(["clone", "--depth", "1", "--branch", reference]);
-                cmd.args([url, temp.to_str().context("invalid temp path")?]);
-                let status = cmd.status().context("git is required for git sources")?;
-                if !status.success() {
-                    let _ = fs::remove_dir_all(&temp);
-                    bail!("failed to clone skill source {url}");
-                }
-                fs::rename(&temp, &cache)?;
                 return Ok(cache);
             }
+            let parent = cache.parent().context("invalid git cache path")?;
+            fs::create_dir_all(parent)?;
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let p = std::env::temp_dir().join(format!("agentx-{stamp}"));
+            let temp = parent.join(format!("clone-{stamp}"));
             let mut cmd = Command::new("git");
-            cmd.args(["clone", "--depth", "1"]);
-            if let Some(reference) = r#ref {
-                cmd.args(["--branch", reference]);
-            }
-            cmd.args([url, p.to_str().context("invalid temp path")?]);
+            cmd.args(["clone", "--depth", "1", "--branch", reference]);
+            cmd.args([url, temp.to_str().context("invalid temp path")?]);
             let status = cmd.status().context("git is required for git sources")?;
             if !status.success() {
-                bail!("failed to clone skill source {url}");
+                let _ = fs::remove_dir_all(&temp);
+                bail!("failed to clone skill source {url}@{reference}");
             }
-            Ok(p)
+            let metadata = temp.join(".git");
+            if metadata.exists() {
+                remove_path(&metadata)?;
+            }
+            fs::rename(&temp, &cache)?;
+            Ok(cache)
         }
     }
 }
@@ -750,12 +747,20 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
             bail!("MCP command cannot be empty: {}", mcp.name);
         }
     }
+    for rule in &m.rules {
+        let source = safe_project_path(&rule.source, "rule source")?;
+        if !source.is_file() {
+            bail!("rule source is not a file: {}", source.display());
+        }
+        security_scan(&source)?;
+    }
     let mut lock = Lock {
         version: 1,
         packages: Vec::new(),
     };
     for skill in &m.skills {
         let source = source_path(&skill.source)?;
+        security_scan(&source)?;
         let source_text = match &skill.source {
             Source::Local { path } => path.clone(),
             Source::Git { url, .. } => url.clone(),
@@ -790,23 +795,52 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
     if !yes {
         println!("Install plan:");
         for t in &targets {
-            let skills = m
+            println!("  {t}:");
+            let skill_root = target_root(t)?;
+            for skill in m
                 .skills
                 .iter()
                 .filter(|skill| skill.targets.is_empty() || skill.targets.iter().any(|x| x == t))
-                .map(|skill| skill.name.as_str())
+            {
+                println!(
+                    "    skill {}: {} -> {}",
+                    skill.name,
+                    source_display(&skill.source),
+                    skill_root.join(&skill.name).display()
+                );
+            }
+            let rules = m
+                .rules
+                .iter()
+                .filter(|rule| rule.targets.is_empty() || rule.targets.iter().any(|x| x == t))
+                .map(|rule| rule.source.as_str())
                 .collect::<Vec<_>>();
-            let mcp = m
+            if !rules.is_empty() {
+                println!(
+                    "    rules [{}] -> {}",
+                    rules.join(", "),
+                    managed_rule_path(t)?.display()
+                );
+            }
+            for server in m
                 .mcp
                 .iter()
                 .filter(|server| server.targets.is_empty() || server.targets.iter().any(|x| x == t))
-                .map(|server| server.name.as_str())
-                .collect::<Vec<_>>();
-            println!(
-                "  {t}: skills [{}], MCP [{}]",
-                skills.join(", "),
-                mcp.join(", ")
-            );
+            {
+                let environment = environment_references(server);
+                println!(
+                    "    MCP {}: command {:?}; args {:?}; environment refs [{}]; target {}",
+                    server.name,
+                    server.command,
+                    server.args,
+                    environment.join(", "),
+                    managed_mcp_paths(t)?
+                        .into_iter()
+                        .next()
+                        .context("missing managed MCP path")?
+                        .display()
+                );
+            }
         }
         println!("install the plan above? [y/N]");
         let mut input = String::new();
@@ -827,11 +861,17 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
             security_scan(&src)?;
             let out = dest.join(&skill.name);
             if out.exists() {
+                let marker = created_marker_path(&out);
+                if marker.exists() {
+                    fs::remove_file(marker)?;
+                }
                 let backup = backup_path(&out);
                 if backup.exists() {
                     remove_path(&backup)?;
                 }
                 fs::rename(&out, &backup)?;
+            } else {
+                fs::write(created_marker_path(&out), b"")?;
             }
             copy_dir(&src, &out)?;
             println!("installed {} -> {}", skill.name, out.display());
@@ -865,6 +905,47 @@ fn validate_manifest_targets(m: &Manifest) -> Result<()> {
     }
     Ok(())
 }
+
+fn source_display(source: &Source) -> String {
+    match source {
+        Source::Local { path } => path.clone(),
+        Source::Git { url, r#ref } => {
+            format!("{}@{}", url, r#ref.as_deref().unwrap_or("<missing-ref>"))
+        }
+    }
+}
+
+fn environment_references(mcp: &Mcp) -> Vec<String> {
+    let mut references = Vec::new();
+    for value in std::iter::once(&mcp.command).chain(mcp.args.iter()) {
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'$' {
+                let braced = bytes.get(index + 1) == Some(&b'{');
+                let start = index + if braced { 2 } else { 1 };
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                if end > start && (!braced || bytes.get(end) == Some(&b'}')) {
+                    let name = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+                    if !references.contains(&name) {
+                        references.push(name);
+                    }
+                }
+                index = end;
+            } else {
+                index += 1;
+            }
+        }
+    }
+    references.sort();
+    references
+}
+
 fn lock_manifest() -> Result<()> {
     let m = load_manifest()?;
     validate_manifest_targets(&m)?;
@@ -872,6 +953,7 @@ fn lock_manifest() -> Result<()> {
     for skill in &m.skills {
         safe_name(&skill.name, "skill name")?;
         let path = source_path(&skill.source)?;
+        security_scan(&path)?;
         let source = match &skill.source {
             Source::Local { path } => path.clone(),
             Source::Git { url, .. } => url.clone(),
@@ -922,7 +1004,7 @@ fn install_mcp(m: &Manifest, target: &str) -> Result<()> {
             install_json_mcp(&path, &selected, "mcpServers")?;
         }
         "windsurf" => {
-            let path = root()?.join(".windsurf/mcp_config.json");
+            let path = dirs_home()?.join(".codeium/windsurf/mcp_config.json");
             backup_file_preserve(&path)?;
             install_json_mcp(&path, &selected, "mcpServers")?;
         }
@@ -937,7 +1019,7 @@ fn install_mcp(m: &Manifest, target: &str) -> Result<()> {
             install_json_mcp(&path, &selected, "mcpServers")?;
         }
         "cline" => {
-            let path = root()?.join(".cline/mcp_settings.json");
+            let path = dirs_home()?.join(".cline/mcp.json");
             backup_file_preserve(&path)?;
             install_json_mcp(&path, &selected, "mcpServers")?;
         }
@@ -1078,6 +1160,15 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.agentx-backup"))
 }
 
+fn created_marker_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.agentx-created",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("managed")
+    ))
+}
+
 fn backup_file(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -1091,6 +1182,11 @@ fn backup_file(path: &Path) -> Result<()> {
 }
 
 fn backup_file_preserve(path: &Path) -> Result<()> {
+    let existed = path.exists();
+    let marker = created_marker_path(path);
+    if marker.exists() {
+        fs::remove_file(&marker)?;
+    }
     let contents = if path.is_file() {
         Some(fs::read(path)?)
     } else {
@@ -1099,6 +1195,11 @@ fn backup_file_preserve(path: &Path) -> Result<()> {
     backup_file(path)?;
     if let Some(contents) = contents {
         fs::write(path, contents)?;
+    } else if !existed {
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(marker, b"")?;
     }
     Ok(())
 }
@@ -1140,6 +1241,13 @@ fn rollback() -> Result<()> {
                 }
                 fs::rename(path, original)?;
                 restored += 1;
+            } else if path.extension().and_then(|x| x.to_str()) == Some("agentx-created") {
+                let original = path.with_extension("");
+                if original.exists() {
+                    remove_path(&original)?;
+                }
+                fs::remove_file(path)?;
+                restored += 1;
             }
         }
     }
@@ -1150,6 +1258,15 @@ fn rollback() -> Result<()> {
         {
             if restore_file(&path)? {
                 restored += 1;
+            } else {
+                let marker = created_marker_path(&path);
+                if marker.exists() {
+                    if path.exists() {
+                        remove_path(&path)?;
+                    }
+                    fs::remove_file(marker)?;
+                    restored += 1;
+                }
             }
         }
     }
@@ -1176,10 +1293,10 @@ fn managed_mcp_paths(target: &str) -> Result<Vec<PathBuf>> {
         "codex" => vec![dirs_home()?.join(".codex/config.toml")],
         "claude" => vec![root()?.join(".mcp.json")],
         "cursor" => vec![root()?.join(".cursor/mcp.json")],
-        "windsurf" => vec![root()?.join(".windsurf/mcp_config.json")],
+        "windsurf" => vec![dirs_home()?.join(".codeium/windsurf/mcp_config.json")],
         "gemini" => vec![root()?.join(".gemini/settings.json")],
         "copilot" => vec![dirs_home()?.join(".copilot/mcp-config.json")],
-        "cline" => vec![root()?.join(".cline/mcp_settings.json")],
+        "cline" => vec![dirs_home()?.join(".cline/mcp.json")],
         "grok" => vec![root()?.join(".grok/config.toml")],
         _ => bail!("unsupported target {target}"),
     })
@@ -1210,7 +1327,7 @@ fn install_rules(m: &Manifest, target: &str) -> Result<()> {
     } else {
         String::new()
     };
-    backup_file(&path)?;
+    backup_file_preserve(&path)?;
     match target {
         "codex" | "claude" => {
             write_atomic(&path, merge_managed_rules(&existing, &text).as_bytes())?;
@@ -1261,11 +1378,121 @@ fn security_scan(path: &Path) -> Result<()> {
                 e.path().display()
             );
         }
-        if e.file_type().is_file() && e.metadata()?.len() > 2_000_000 {
-            bail!("skill file exceeds 2MB: {}", e.path().display());
+        if e.file_type().is_file() {
+            if e.metadata()?.len() > 2_000_000 {
+                bail!("skill file exceeds 2MB: {}", e.path().display());
+            }
+            if is_forbidden_skill_file(e.path()) {
+                bail!(
+                    "credential or private-key file is not allowed in a skill package: {}",
+                    e.path().display()
+                );
+            }
+            if is_unexpected_executable(e.path())? {
+                bail!(
+                    "native or unexpected executable is not allowed in a skill package: {}",
+                    e.path().display()
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn is_forbidden_skill_file(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            ".git" | ".hg" | ".svn" | ".ssh" | ".aws" | ".azure" | ".kube"
+        )
+    }) {
+        return true;
+    }
+    let Some(name) = components.last() else {
+        return false;
+    };
+    if name == ".env"
+        || name.starts_with(".env.")
+        || matches!(
+            name.as_str(),
+            ".netrc"
+                | ".npmrc"
+                | ".pypirc"
+                | "credentials"
+                | "credentials.json"
+                | "credentials.yaml"
+                | "credentials.yml"
+                | "secrets"
+                | "secrets.json"
+                | "secrets.yaml"
+                | "secrets.yml"
+                | "tokens.json"
+                | "cookies.json"
+                | "session.json"
+                | "sessions.json"
+                | "id_rsa"
+                | "id_dsa"
+                | "id_ecdsa"
+                | "id_ed25519"
+        )
+        || name.contains("private_key")
+        || name.contains("private-key")
+    {
+        return true;
+    }
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("pem" | "key" | "p12" | "pfx" | "jks" | "keystore")
+    )
+}
+
+fn is_unexpected_executable(path: &Path) -> Result<bool> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(
+        extension.as_deref(),
+        Some("exe" | "dll" | "so" | "dylib" | "node" | "wasm")
+    ) {
+        return Ok(true);
+    }
+    let mut header = [0_u8; 8];
+    let mut file = fs::File::open(path)?;
+    let read = file.read(&mut header)?;
+    let bytes = &header[..read];
+    let native_magic = bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"MZ")
+        || bytes.starts_with(b"\0asm")
+        || matches!(
+            bytes.get(..4),
+            Some(
+                [0xfe, 0xed, 0xfa, 0xce]
+                    | [0xfe, 0xed, 0xfa, 0xcf]
+                    | [0xce, 0xfa, 0xed, 0xfe]
+                    | [0xcf, 0xfa, 0xed, 0xfe]
+                    | [0xca, 0xfe, 0xba, 0xbe]
+            )
+        );
+    if native_magic {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path)?.permissions().mode() & 0o111 != 0 && !bytes.starts_with(b"#!") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
@@ -1291,7 +1518,9 @@ fn diff(target: Option<&str>) -> Result<()> {
             if !skill.targets.is_empty() && !skill.targets.iter().any(|x| x == &target) {
                 continue;
             }
-            let expected = sha256_dir(&source_path(&skill.source)?)?;
+            let source = source_path(&skill.source)?;
+            security_scan(&source)?;
+            let expected = sha256_dir(&source)?;
             let actual = dest.join(&skill.name);
             if !actual.exists() {
                 println!("{target}: missing skill {}", skill.name);
@@ -1373,10 +1602,9 @@ fn selected_rules(m: &Manifest, target: &str) -> Result<String> {
     let mut text = String::new();
     for rule in &m.rules {
         if rule.targets.is_empty() || rule.targets.iter().any(|item| item == target) {
-            text.push_str(&fs::read_to_string(safe_project_path(
-                &rule.source,
-                "rule source",
-            )?)?);
+            let path = safe_project_path(&rule.source, "rule source")?;
+            security_scan(&path)?;
+            text.push_str(&fs::read_to_string(path)?);
             text.push_str("\n\n");
         }
     }
@@ -1502,6 +1730,37 @@ mod tests {
         fs::write(&file, vec![0_u8; 2_000_001]).unwrap();
         assert!(security_scan(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn security_scan_rejects_credentials_and_native_executables() {
+        let credentials =
+            std::env::temp_dir().join(format!("agentx-credentials-{}", std::process::id()));
+        fs::create_dir_all(&credentials).unwrap();
+        fs::write(credentials.join(".env.production"), "TOKEN=secret").unwrap();
+        assert!(security_scan(&credentials).is_err());
+        fs::remove_dir_all(credentials).unwrap();
+
+        let executable =
+            std::env::temp_dir().join(format!("agentx-executable-{}", std::process::id()));
+        fs::create_dir_all(&executable).unwrap();
+        fs::write(executable.join("payload"), b"\x7fELF\x02\x01\x01\0").unwrap();
+        assert!(security_scan(&executable).is_err());
+        fs::remove_dir_all(executable).unwrap();
+    }
+
+    #[test]
+    fn environment_references_are_disclosed_without_duplicates() {
+        let mcp = Mcp {
+            name: "docs".into(),
+            command: "sh".into(),
+            args: vec![
+                "-lc".into(),
+                "serve --token $TOKEN --org ${ORG}-$TOKEN".into(),
+            ],
+            targets: vec![],
+        };
+        assert_eq!(environment_references(&mcp), vec!["ORG", "TOKEN"]);
     }
 
     #[test]

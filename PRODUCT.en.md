@@ -26,7 +26,7 @@ mcp:
     targets: [codex]
 ```
 
-Skills use a local directory or a Git URL with an optional fixed `ref`. Relative paths are resolved from the project root; traversal, symlinks, oversized files, unsafe names, and unsupported targets are rejected. MCP entries currently contain only `name`, `command`, `args`, and optional `targets`. URL, headers, and environment-variable transports are not represented by this schema and must be configured natively.
+Skills use a local directory or a Git URL with a required fixed `ref`. Relative paths are resolved from the project root; traversal, symlinks, oversized files, unsafe names, and unsupported targets are rejected. MCP entries currently contain only `name`, `command`, `args`, and optional `targets`. URL, headers, and environment-variable transports are not represented by this schema and must be configured natively.
 
 The supported output locations are listed in [`README.en.md`](README.en.md). Rules and MCP files are backed up before installation. `rollback` restores those files and Skill directories; pre-existing Codex and Claude rule text outside the managed markers is retained.
 
@@ -34,7 +34,7 @@ The supported output locations are listed in [`README.en.md`](README.en.md). Rul
 
 `agentx lock` records each Skill source, Git ref, and content SHA-256 in `agentx.lock`. `agentx install --frozen` refuses changed source content. `agentx diff` checks Skills, Rules, and MCP for the selected target; `--target` accepts one of `codex`, `claude`, `cursor`, `windsurf`, `gemini`, `copilot`, `cline`, or `grok`. `doctor` reports CLI availability and configured adapter locations.
 
-Installation runs a security scan before mutating files. The scan rejects symlinks and files larger than 2 MiB in Skill sources. MCP commands are executable on a developer machine, so review a team manifest before installing it.
+Installation runs a security scan before mutating files. The scan rejects symlinks, files larger than 2 MiB, credential/private-key names, and native or unexpected executable payloads in Skill sources. Interactive plans disclose Skill and Rules destinations plus every MCP command, argument, detected environment reference, and target configuration path. MCP commands are executable on a developer machine, so review a team manifest before installing it.
 
 ## Registry model
 
