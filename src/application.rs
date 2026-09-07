@@ -30,7 +30,10 @@ enum Commands {
         #[arg(long)]
         frozen: bool,
     },
-    Diff,
+    Diff {
+        #[arg(long)]
+        target: Option<String>,
+    },
     Doctor,
     Lock,
     Rollback,
@@ -172,6 +175,8 @@ struct Lock {
 struct LockedPackage {
     name: String,
     source: String,
+    #[serde(default, rename = "ref")]
+    r#ref: Option<String>,
     sha256: String,
 }
 
@@ -184,7 +189,7 @@ pub(crate) fn run() -> Result<()> {
             yes,
             frozen,
         } => install(target.as_deref(), yes, frozen),
-        Commands::Diff => diff(),
+        Commands::Diff { target } => diff(target.as_deref()),
         Commands::Doctor => doctor(),
         Commands::Lock => lock_manifest(),
         Commands::Rollback => rollback(),
@@ -612,7 +617,7 @@ fn init() -> Result<()> {
 fn source_path(source: &Source) -> Result<PathBuf> {
     match source {
         Source::Local { path } => {
-            let p = root()?.join(path);
+            let p = safe_project_path(path, "skill source")?;
             if !p.is_dir() {
                 bail!("skill source is not a directory: {}", p.display());
             }
@@ -661,6 +666,33 @@ fn source_path(source: &Source) -> Result<PathBuf> {
         }
     }
 }
+
+fn safe_project_path(value: &str, label: &str) -> Result<PathBuf> {
+    let relative = Path::new(value);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("{label} must stay inside the project: {value}");
+    }
+    Ok(root()?.join(relative))
+}
+
+fn safe_name(value: &str, label: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        bail!("{label} must be a single safe path component: {value}");
+    }
+    Ok(())
+}
 fn sha256_dir(path: &Path) -> Result<String> {
     let mut files = Vec::new();
     for entry in WalkDir::new(path).follow_links(false) {
@@ -697,6 +729,7 @@ fn target_root(target: &str) -> Result<PathBuf> {
 }
 fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
     let m = load_manifest()?;
+    validate_manifest_targets(&m)?;
     let targets = target
         .map(|x| vec![x.to_string()])
         .unwrap_or_else(|| vec!["codex".into(), "claude".into()]);
@@ -706,6 +739,15 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
                 "unsupported target {target}; use {}",
                 SUPPORTED_TARGETS.join(", ")
             );
+        }
+    }
+    for skill in &m.skills {
+        safe_name(&skill.name, "skill name")?;
+    }
+    for mcp in &m.mcp {
+        safe_name(&mcp.name, "MCP name")?;
+        if mcp.command.trim().is_empty() {
+            bail!("MCP command cannot be empty: {}", mcp.name);
         }
     }
     let mut lock = Lock {
@@ -721,6 +763,10 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
         lock.packages.push(LockedPackage {
             name: skill.name.clone(),
             source: source_text,
+            r#ref: match &skill.source {
+                Source::Git { r#ref, .. } => r#ref.clone(),
+                Source::Local { .. } => None,
+            },
             sha256: sha256_dir(&source)?,
         });
     }
@@ -728,11 +774,12 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
     if frozen && lock_path.exists() {
         let existing: Lock = serde_yaml::from_str(&fs::read_to_string(&lock_path)?)?;
         if existing.packages.len() != lock.packages.len()
-            || existing
-                .packages
-                .iter()
-                .zip(&lock.packages)
-                .any(|(a, b)| a.name != b.name || a.sha256 != b.sha256)
+            || existing.packages.iter().zip(&lock.packages).any(|(a, b)| {
+                a.name != b.name
+                    || a.source != b.source
+                    || a.r#ref != b.r#ref
+                    || a.sha256 != b.sha256
+            })
         {
             bail!("lockfile does not match sources; run `agentx lock` first");
         }
@@ -741,11 +788,27 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
         bail!("agentx.lock is required with --frozen");
     }
     if !yes {
-        println!(
-            "install {} skill(s) for {}? [y/N]",
-            m.skills.len(),
-            targets.join(", ")
-        );
+        println!("Install plan:");
+        for t in &targets {
+            let skills = m
+                .skills
+                .iter()
+                .filter(|skill| skill.targets.is_empty() || skill.targets.iter().any(|x| x == t))
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>();
+            let mcp = m
+                .mcp
+                .iter()
+                .filter(|server| server.targets.is_empty() || server.targets.iter().any(|x| x == t))
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>();
+            println!(
+                "  {t}: skills [{}], MCP [{}]",
+                skills.join(", "),
+                mcp.join(", ")
+            );
+        }
+        println!("install the plan above? [y/N]");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {
@@ -761,16 +824,16 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
                 continue;
             }
             let src = source_path(&skill.source)?;
+            security_scan(&src)?;
             let out = dest.join(&skill.name);
             if out.exists() {
-                let backup = out.with_extension("agentx-backup");
+                let backup = backup_path(&out);
                 if backup.exists() {
-                    fs::remove_dir_all(&backup)?;
+                    remove_path(&backup)?;
                 }
                 fs::rename(&out, &backup)?;
             }
             copy_dir(&src, &out)?;
-            security_scan(&out)?;
             println!("installed {} -> {}", skill.name, out.display());
         }
         install_rules(&m, t)?;
@@ -784,10 +847,30 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
     fs::write(lock_path, serde_yaml::to_string(&lock)?)?;
     Ok(())
 }
+
+fn validate_manifest_targets(m: &Manifest) -> Result<()> {
+    for target in m
+        .skills
+        .iter()
+        .flat_map(|item| item.targets.iter())
+        .chain(m.rules.iter().flat_map(|item| item.targets.iter()))
+        .chain(m.mcp.iter().flat_map(|item| item.targets.iter()))
+    {
+        if !SUPPORTED_TARGETS.contains(&target.as_str()) {
+            bail!(
+                "unsupported target {target}; use {}",
+                SUPPORTED_TARGETS.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
 fn lock_manifest() -> Result<()> {
     let m = load_manifest()?;
+    validate_manifest_targets(&m)?;
     let mut packages = Vec::new();
     for skill in &m.skills {
+        safe_name(&skill.name, "skill name")?;
         let path = source_path(&skill.source)?;
         let source = match &skill.source {
             Source::Local { path } => path.clone(),
@@ -796,6 +879,10 @@ fn lock_manifest() -> Result<()> {
         packages.push(LockedPackage {
             name: skill.name.clone(),
             source,
+            r#ref: match &skill.source {
+                Source::Git { r#ref, .. } => r#ref.clone(),
+                Source::Local { .. } => None,
+            },
             sha256: sha256_dir(&path)?,
         });
     }
@@ -818,40 +905,47 @@ fn install_mcp(m: &Manifest, target: &str) -> Result<()> {
     if selected.is_empty() {
         return Ok(());
     }
-    let config = target_root(target)?
-        .parent()
-        .context("invalid target path")?
-        .join("agentx-mcp.json");
-    let entries: Vec<_> = selected
-        .iter()
-        .map(|m| serde_json::json!({"name": m.name, "command": m.command, "args": m.args}))
-        .collect();
-    write_atomic(&config, serde_json::to_vec_pretty(&entries)?.as_slice())?;
     match target {
-        "codex" => install_codex_mcp(&selected)?,
-        "claude" => install_claude_mcp(&selected)?,
-        "cursor" => install_json_mcp(&root()?.join(".cursor/mcp.json"), &selected, "mcpServers")?,
-        "windsurf" => install_json_mcp(
-            &root()?.join(".windsurf/mcp_config.json"),
-            &selected,
-            "mcpServers",
-        )?,
-        "gemini" => install_json_mcp(
-            &root()?.join(".gemini/settings.json"),
-            &selected,
-            "mcpServers",
-        )?,
-        "copilot" => install_json_mcp(
-            &dirs_home()?.join(".copilot/mcp-config.json"),
-            &selected,
-            "mcpServers",
-        )?,
-        "cline" => install_json_mcp(
-            &root()?.join(".cline/mcp_settings.json"),
-            &selected,
-            "mcpServers",
-        )?,
-        "grok" => install_grok_mcp(&selected)?,
+        "codex" => {
+            let path = dirs_home()?.join(".codex/config.toml");
+            backup_file_preserve(&path)?;
+            install_codex_mcp(&selected)?;
+        }
+        "claude" => {
+            let path = root()?.join(".mcp.json");
+            backup_file_preserve(&path)?;
+            install_claude_mcp(&selected)?;
+        }
+        "cursor" => {
+            let path = root()?.join(".cursor/mcp.json");
+            backup_file_preserve(&path)?;
+            install_json_mcp(&path, &selected, "mcpServers")?;
+        }
+        "windsurf" => {
+            let path = root()?.join(".windsurf/mcp_config.json");
+            backup_file_preserve(&path)?;
+            install_json_mcp(&path, &selected, "mcpServers")?;
+        }
+        "gemini" => {
+            let path = root()?.join(".gemini/settings.json");
+            backup_file_preserve(&path)?;
+            install_json_mcp(&path, &selected, "mcpServers")?;
+        }
+        "copilot" => {
+            let path = dirs_home()?.join(".copilot/mcp-config.json");
+            backup_file_preserve(&path)?;
+            install_json_mcp(&path, &selected, "mcpServers")?;
+        }
+        "cline" => {
+            let path = root()?.join(".cline/mcp_settings.json");
+            backup_file_preserve(&path)?;
+            install_json_mcp(&path, &selected, "mcpServers")?;
+        }
+        "grok" => {
+            let path = root()?.join(".grok/config.toml");
+            backup_file_preserve(&path)?;
+            install_grok_mcp(&selected)?;
+        }
         _ => {}
     }
     Ok(())
@@ -893,8 +987,7 @@ fn install_codex_mcp(selected: &[&Mcp]) -> Result<()> {
 }
 
 fn install_claude_mcp(selected: &[&Mcp]) -> Result<()> {
-    let dirs = BaseDirs::new().context("cannot find home directory")?;
-    let path = dirs.home_dir().join(".claude.json");
+    let path = root()?.join(".mcp.json");
     let mut document = if path.exists() {
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path)?)?
     } else {
@@ -976,6 +1069,61 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(temp, path)?;
     Ok(())
 }
+
+fn backup_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("managed");
+    path.with_file_name(format!("{name}.agentx-backup"))
+}
+
+fn backup_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let backup = backup_path(path);
+    if backup.exists() {
+        remove_path(&backup)?;
+    }
+    fs::rename(path, backup)?;
+    Ok(())
+}
+
+fn backup_file_preserve(path: &Path) -> Result<()> {
+    let contents = if path.is_file() {
+        Some(fs::read(path)?)
+    } else {
+        None
+    };
+    backup_file(path)?;
+    if let Some(contents) = contents {
+        fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn restore_file(path: &Path) -> Result<bool> {
+    let backup = backup_path(path);
+    if !backup.exists() {
+        return Ok(false);
+    }
+    if path.exists() {
+        remove_path(path)?;
+    }
+    fs::rename(backup, path)?;
+    Ok(true)
+}
 fn rollback() -> Result<()> {
     let mut restored = 0;
     for target in SUPPORTED_TARGETS {
@@ -988,9 +1136,19 @@ fn rollback() -> Result<()> {
             if path.extension().and_then(|x| x.to_str()) == Some("agentx-backup") {
                 let original = path.with_extension("");
                 if original.exists() {
-                    fs::remove_dir_all(&original)?;
+                    remove_path(&original)?;
                 }
                 fs::rename(path, original)?;
+                restored += 1;
+            }
+        }
+    }
+    for target in SUPPORTED_TARGETS {
+        for path in managed_rule_paths(target)?
+            .into_iter()
+            .chain(managed_mcp_paths(target)?.into_iter())
+        {
+            if restore_file(&path)? {
                 restored += 1;
             }
         }
@@ -998,11 +1156,47 @@ fn rollback() -> Result<()> {
     println!("restored {restored} backup(s)");
     Ok(())
 }
+
+fn managed_rule_paths(target: &str) -> Result<Vec<PathBuf>> {
+    Ok(match target {
+        "codex" => vec![root()?.join("AGENTS.md")],
+        "claude" => vec![root()?.join("CLAUDE.md")],
+        "cursor" => vec![root()?.join(".cursor/rules/agentx.mdc")],
+        "windsurf" => vec![root()?.join(".windsurf/rules/agentx.md")],
+        "gemini" => vec![root()?.join("GEMINI.md")],
+        "copilot" => vec![root()?.join(".github/copilot-instructions.md")],
+        "cline" => vec![root()?.join(".clinerules/agentx.md")],
+        "grok" => vec![root()?.join(".grok/rules/agentx.md")],
+        _ => bail!("unsupported target {target}"),
+    })
+}
+
+fn managed_mcp_paths(target: &str) -> Result<Vec<PathBuf>> {
+    Ok(match target {
+        "codex" => vec![dirs_home()?.join(".codex/config.toml")],
+        "claude" => vec![root()?.join(".mcp.json")],
+        "cursor" => vec![root()?.join(".cursor/mcp.json")],
+        "windsurf" => vec![root()?.join(".windsurf/mcp_config.json")],
+        "gemini" => vec![root()?.join(".gemini/settings.json")],
+        "copilot" => vec![dirs_home()?.join(".copilot/mcp-config.json")],
+        "cline" => vec![root()?.join(".cline/mcp_settings.json")],
+        "grok" => vec![root()?.join(".grok/config.toml")],
+        _ => bail!("unsupported target {target}"),
+    })
+}
+
+fn managed_rule_path(target: &str) -> Result<PathBuf> {
+    managed_rule_paths(target)?
+        .into_iter()
+        .next()
+        .context("missing managed rule path")
+}
+
 fn install_rules(m: &Manifest, target: &str) -> Result<()> {
     let mut text = String::new();
     for rule in &m.rules {
         if rule.targets.is_empty() || rule.targets.iter().any(|x| x == target) {
-            let p = root()?.join(&rule.source);
+            let p = safe_project_path(&rule.source, "rule source")?;
             text.push_str(&fs::read_to_string(p)?);
             text.push_str("\n\n");
         }
@@ -1010,37 +1204,53 @@ fn install_rules(m: &Manifest, target: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    let path = managed_rule_path(target)?;
+    let existing = if matches!(target, "codex" | "claude") {
+        fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    backup_file(&path)?;
     match target {
         "codex" | "claude" => {
-            let filename = if target == "codex" {
-                "AGENTS.md"
-            } else {
-                "CLAUDE.md"
-            };
-            fs::write(root()?.join(filename), text)?;
+            write_atomic(&path, merge_managed_rules(&existing, &text).as_bytes())?;
         }
         "cursor" => {
             let dir = root()?.join(".cursor/rules");
             fs::create_dir_all(&dir)?;
             write_atomic(
-                &dir.join("agentx.mdc"),
+                &path,
                 format!(
                     "---\ndescription: AgentX managed project rules\nalwaysApply: true\n---\n\n{text}"
                 )
                 .as_bytes(),
             )?;
         }
-        "windsurf" => write_atomic(&root()?.join(".windsurf/rules/agentx.md"), text.as_bytes())?,
-        "gemini" => write_atomic(&root()?.join("GEMINI.md"), text.as_bytes())?,
-        "copilot" => write_atomic(
-            &root()?.join(".github/copilot-instructions.md"),
-            text.as_bytes(),
-        )?,
-        "cline" => write_atomic(&root()?.join(".clinerules/agentx.md"), text.as_bytes())?,
-        "grok" => write_atomic(&root()?.join(".grok/rules/agentx.md"), text.as_bytes())?,
+        "windsurf" | "gemini" | "copilot" | "cline" | "grok" => {
+            write_atomic(&path, text.as_bytes())?
+        }
         _ => bail!("unsupported target {target}"),
     }
     Ok(())
+}
+
+const RULES_BEGIN: &str = "<!-- BEGIN AGENTX MANAGED RULES -->";
+const RULES_END: &str = "<!-- END AGENTX MANAGED RULES -->";
+
+fn merge_managed_rules(existing: &str, rules: &str) -> String {
+    let block = format!("{RULES_BEGIN}\n{rules}\n{RULES_END}");
+    if let (Some(start), Some(end)) = (existing.find(RULES_BEGIN), existing.find(RULES_END)) {
+        let end = end + RULES_END.len();
+        let mut merged = String::with_capacity(existing.len() + rules.len());
+        merged.push_str(&existing[..start]);
+        merged.push_str(&block);
+        merged.push_str(&existing[end..]);
+        merged
+    } else if existing.trim().is_empty() {
+        block + "\n"
+    } else {
+        format!("{}\n\n{}\n", existing.trim_end(), block)
+    }
 }
 fn security_scan(path: &Path) -> Result<()> {
     for entry in WalkDir::new(path).follow_links(false) {
@@ -1071,50 +1281,201 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn diff() -> Result<()> {
+fn diff(target: Option<&str>) -> Result<()> {
     let m = load_manifest()?;
-    for target in SUPPORTED_TARGETS {
-        let dest = target_root(target)?;
+    validate_manifest_targets(&m)?;
+    let targets = selected_targets(&m, target)?;
+    for target in targets {
+        let dest = target_root(&target)?;
         for skill in &m.skills {
+            if !skill.targets.is_empty() && !skill.targets.iter().any(|x| x == &target) {
+                continue;
+            }
             let expected = sha256_dir(&source_path(&skill.source)?)?;
             let actual = dest.join(&skill.name);
             if !actual.exists() {
-                println!("{target}: missing {}", skill.name);
+                println!("{target}: missing skill {}", skill.name);
             } else {
                 let got = sha256_dir(&actual)?;
                 println!(
-                    "{target}: {} {}",
+                    "{target}: skill {} {}",
                     skill.name,
                     if got == expected { "ok" } else { "drift" }
                 );
             }
         }
+        let expected_rules = selected_rules(&m, &target)?;
+        if !expected_rules.is_empty() {
+            let path = managed_rule_path(&target)?;
+            let actual = fs::read_to_string(&path).unwrap_or_default();
+            let matches = if matches!(target.as_str(), "codex" | "claude") {
+                actual.contains(&expected_rules)
+            } else if target == "cursor" {
+                actual.contains(&expected_rules)
+            } else {
+                actual == expected_rules
+            };
+            println!(
+                "{target}: rules {} {}",
+                path.display(),
+                if matches { "ok" } else { "drift/missing" }
+            );
+        }
+        let selected_mcp: Vec<_> = m
+            .mcp
+            .iter()
+            .filter(|server| {
+                server.targets.is_empty() || server.targets.iter().any(|item| item == &target)
+            })
+            .collect();
+        if !selected_mcp.is_empty() {
+            let path = managed_mcp_paths(&target)?
+                .into_iter()
+                .next()
+                .context("missing managed MCP path")?;
+            let matches = mcp_config_matches(&path, &target, &selected_mcp)?;
+            println!(
+                "{target}: MCP {} {}",
+                path.display(),
+                if matches { "ok" } else { "drift/missing" }
+            );
+        }
     }
     Ok(())
 }
+
+fn selected_targets(m: &Manifest, requested: Option<&str>) -> Result<Vec<String>> {
+    if let Some(target) = requested {
+        if !SUPPORTED_TARGETS.contains(&target) {
+            bail!(
+                "unsupported target {target}; use {}",
+                SUPPORTED_TARGETS.join(", ")
+            );
+        }
+        return Ok(vec![target.to_string()]);
+    }
+    let mut targets = vec!["codex".to_string(), "claude".to_string()];
+    for target in m
+        .skills
+        .iter()
+        .flat_map(|item| item.targets.iter())
+        .chain(m.rules.iter().flat_map(|item| item.targets.iter()))
+        .chain(m.mcp.iter().flat_map(|item| item.targets.iter()))
+    {
+        if SUPPORTED_TARGETS.contains(&target.as_str()) && !targets.contains(target) {
+            targets.push(target.clone());
+        }
+    }
+    Ok(targets)
+}
+
+fn selected_rules(m: &Manifest, target: &str) -> Result<String> {
+    let mut text = String::new();
+    for rule in &m.rules {
+        if rule.targets.is_empty() || rule.targets.iter().any(|item| item == target) {
+            text.push_str(&fs::read_to_string(safe_project_path(
+                &rule.source,
+                "rule source",
+            )?)?);
+            text.push_str("\n\n");
+        }
+    }
+    Ok(text)
+}
+
+fn mcp_config_matches(path: &Path, target: &str, selected: &[&Mcp]) -> Result<bool> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(false),
+    };
+    if target == "codex" || target == "grok" {
+        let document: toml::Value = toml::from_str(&raw)?;
+        let Some(servers) = document.get("mcp_servers").and_then(toml::Value::as_table) else {
+            return Ok(false);
+        };
+        return Ok(selected.iter().all(|server| {
+            let Some(value) = servers.get(&server.name).and_then(toml::Value::as_table) else {
+                return false;
+            };
+            value.get("command").and_then(toml::Value::as_str) == Some(server.command.as_str())
+                && value
+                    .get("args")
+                    .and_then(toml::Value::as_array)
+                    .map(|args| {
+                        args.iter()
+                            .filter_map(toml::Value::as_str)
+                            .eq(server.args.iter().map(String::as_str))
+                    })
+                    .unwrap_or(false)
+        }));
+    }
+    let document: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(servers) = document
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(false);
+    };
+    Ok(selected.iter().all(|server| {
+        servers.get(&server.name).is_some_and(|value| {
+            value.get("command").and_then(serde_json::Value::as_str)
+                == Some(server.command.as_str())
+                && value
+                    .get("args")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|args| {
+                        args.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .eq(server.args.iter().map(String::as_str))
+                    })
+                    .unwrap_or(false)
+        })
+    }))
+}
 fn doctor() -> Result<()> {
     for target in SUPPORTED_TARGETS {
-        let bin = target;
-        let found = std::process::Command::new("sh")
-            .args(["-lc", &format!("command -v {bin}")])
-            .output()?
-            .status
-            .success();
-        let configured = target_root(target)?
-            .parent()
-            .map(Path::exists)
-            .unwrap_or(false);
+        let cli = target_command(target)
+            .map(|command| {
+                let found = std::process::Command::new("sh")
+                    .args(["-lc", &format!("command -v {command}")])
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                if found { "available" } else { "not found" }
+            })
+            .unwrap_or("no standalone CLI");
+        let skills = target_root(target)?;
+        let rules = managed_rule_paths(target)?
+            .into_iter()
+            .any(|path| path.exists());
+        let mcp = managed_mcp_paths(target)?
+            .into_iter()
+            .any(|path| path.exists());
         println!(
-            "{target}: {}",
-            if found || configured {
-                "detected"
+            "{target}: CLI {cli}; project adapter {}",
+            if rules || mcp || skills.exists() {
+                "configured"
             } else {
-                "not found"
+                "not configured"
             }
         );
-        println!("  skills dir: {}", target_root(target)?.display());
+        println!("  skills dir: {}", skills.display());
     }
     Ok(())
+}
+
+fn target_command(target: &str) -> Option<&'static str> {
+    match target {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "cursor" => Some("cursor-agent"),
+        "windsurf" => Some("windsurf"),
+        "gemini" => Some("gemini"),
+        "copilot" => Some("gh"),
+        "grok" => Some("grok"),
+        "cline" => None,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1184,5 +1545,25 @@ mod tests {
         assert_eq!(value["mcpServers"]["existing"]["command"], "keep");
         assert_eq!(value["mcpServers"]["docs"]["command"], "npx");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_paths_and_names_reject_traversal() {
+        assert!(safe_project_path("../outside", "source").is_err());
+        assert!(safe_project_path("/tmp/outside", "source").is_err());
+        assert!(safe_name("../outside", "skill").is_err());
+        assert!(safe_name("nested/name", "skill").is_err());
+        assert!(safe_name(".", "skill").is_err());
+    }
+
+    #[test]
+    fn managed_rules_preserve_user_content_and_replace_block() {
+        let first = merge_managed_rules("# User rules\n", "# AgentX rules\n");
+        assert!(first.starts_with("# User rules"));
+        assert!(first.contains(RULES_BEGIN));
+        let second = merge_managed_rules(&first, "# Updated rules\n");
+        assert!(second.contains("# User rules"));
+        assert!(second.contains("# Updated rules"));
+        assert!(!second.contains("# AgentX rules"));
     }
 }

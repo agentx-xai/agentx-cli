@@ -1,5 +1,7 @@
 # AgentX CLI
 
+[English](README.en.md) | 中文
+
 <p align="center"><img src="https://raw.githubusercontent.com/agentx-xai/.github/main/profile/agentx-mark.svg" alt="AgentX" width="88"></p>
 
 <p align="center">
@@ -55,22 +57,24 @@ agentx install --target cline --yes --frozen
 agentx install --target grok --yes --frozen
 ```
 
-省略 `--target` 时保持向后兼容，只安装 Codex 和 Claude Code。
+省略 `--target` 时保持向后兼容，只安装 Codex 和 Claude Code。`agentx diff --target grok` 可单独检查某个 Agent。
 
 支持的 target 和生成位置：
 
 | Target | Rules | Skills | MCP |
 | --- | --- | --- | --- |
 | `codex` | `AGENTS.md` | `~/.codex/skills` | `~/.codex/config.toml` |
-| `claude` | `CLAUDE.md` | `~/.claude/skills` | `~/.claude.json` |
+| `claude` | `CLAUDE.md` (managed block) | `~/.claude/skills` | `.mcp.json` |
 | `cursor` | `.cursor/rules/agentx.mdc` | `.cursor/skills` | `.cursor/mcp.json` |
 | `windsurf` | `.windsurf/rules/agentx.md` | `.windsurf/skills` | `.windsurf/mcp_config.json` |
 | `gemini` | `GEMINI.md` | `.gemini/skills` | `.gemini/settings.json` |
 | `copilot` | `.github/copilot-instructions.md` | `.github/skills` | `~/.copilot/mcp-config.json` |
 | `cline` | `.clinerules/agentx.md` | `.cline/skills` | `.cline/mcp_settings.json` |
-| `grok` | `.grok/rules/agentx.md` | `.grok/skills` | `.grok/config.toml` |
+| `grok` | `.grok/rules/agentx.md` | `.grok/skills` | `.grok/config.toml` (`[mcp_servers.<name>]`) |
 
-推送形如 `v0.1.2` 的 Tag 会触发 `.github/workflows/release.yml`，先运行格式检查、测试和 release 构建，再创建 GitHub Release 并上传 Linux CLI 压缩包。
+推送形如 `v0.1.2` 的 Tag 会触发 `.github/workflows/release.yml`，先运行格式检查、测试和 release 构建，再创建 GitHub Release 并上传 Linux CLI 压缩包和 SHA-256 校验和。Tag 可通过 GitHub Actions 的 `Tag` workflow 从指定分支创建。
+
+当前 Manifest 的 MCP 字段只支持 `command` 和 `args`；URL、headers、env 等传输能力不会被 CLI 自动生成，需要在 Agent 原生配置中维护。
 
 CLI 远程凭据保存在用户配置目录，拉取时会重新校验 SHA-256。服务端可使用 PostgreSQL、API token、HMAC JWT 或配置 `AGENTX_OIDC_ISSUER` 启用 OIDC discovery/JWKS 验证，并支持 Ed25519 artifact 签名验证。
 

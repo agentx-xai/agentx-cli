@@ -35,6 +35,12 @@ fn install_compiles_all_supported_target_formats() {
     let home = temp_dir("adapter-home");
     fs::create_dir_all(project.join("skills/demo")).unwrap();
     fs::create_dir_all(project.join("rules")).unwrap();
+    fs::create_dir_all(project.join(".grok")).unwrap();
+    fs::write(
+        project.join(".grok/config.toml"),
+        "[ui]\ntheme = \"dark\"\n",
+    )
+    .unwrap();
     fs::write(project.join("skills/demo/SKILL.md"), "# Demo\n").unwrap();
     fs::write(project.join("rules/team.md"), "# Team rules\n").unwrap();
     fs::write(
@@ -86,7 +92,7 @@ fn install_compiles_all_supported_target_formats() {
 
     for path in [
         home.join(".codex/config.toml"),
-        home.join(".claude.json"),
+        project.join(".mcp.json"),
         project.join(".cursor/mcp.json"),
         project.join(".windsurf/mcp_config.json"),
         project.join(".gemini/settings.json"),
@@ -100,6 +106,20 @@ fn install_compiles_all_supported_target_formats() {
             path.display()
         );
     }
+
+    let grok_rules = fs::read_to_string(project.join(".grok/rules/agentx.md")).unwrap();
+    assert!(grok_rules.contains("# Team rules"));
+    let grok_config: toml::Value =
+        toml::from_str(&fs::read_to_string(project.join(".grok/config.toml")).unwrap()).unwrap();
+    assert_eq!(grok_config["ui"]["theme"].as_str(), Some("dark"));
+    assert_eq!(
+        grok_config["mcp_servers"]["docs"]["command"].as_str(),
+        Some("npx")
+    );
+    assert_eq!(
+        grok_config["mcp_servers"]["docs"]["args"][0].as_str(),
+        Some("-y")
+    );
 
     fs::remove_dir_all(project).unwrap();
     fs::remove_dir_all(home).unwrap();

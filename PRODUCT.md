@@ -1,5 +1,7 @@
 # AgentX 产品文档
 
+[English](PRODUCT.en.md) | 中文
+
 ## 1. 产品概述
 
 AgentX 用一份声明式配置管理 AI Agent 的工作环境。它把 Skills、Rules、MCP 服务、版本和团队策略集中描述，再生成 Codex、Claude Code、Cursor、Gemini CLI、Copilot、Cline 和 Grok Build 等 Agent 可以直接使用的本地配置。
@@ -38,7 +40,7 @@ mcp:
     targets: [codex]
 ```
 
-`skills` 可以来自本地目录或固定 Git ref。`rules` 和 `mcp` 会按 target 生成对应 Agent 的文件：Cursor 使用 `.cursor/rules/*.mdc` 与 `.cursor/mcp.json`，Windsurf 使用 `.windsurf/rules` 与 `.windsurf/mcp_config.json`，Gemini CLI 使用 `GEMINI.md`、`.gemini/skills` 与 `.gemini/settings.json`，Copilot 使用 `.github/copilot-instructions.md`，Cline 使用 `.clinerules`、`.cline/skills` 与 `.cline/mcp_settings.json`，Grok Build 使用 `.grok/rules`、`.grok/skills` 与 `.grok/config.toml`。
+`skills` 可以来自本地目录或固定 Git ref。`rules` 和 `mcp` 会按 target 生成对应 Agent 的文件：Codex 使用 `AGENTS.md` 中的受管区块、`~/.codex/skills` 与 `~/.codex/config.toml`；Claude Code 使用 `CLAUDE.md` 中的受管区块、`~/.claude/skills` 与项目 `.mcp.json`；Cursor 使用 `.cursor/rules/*.mdc` 与 `.cursor/mcp.json`；Windsurf 使用 `.windsurf/rules` 与 `.windsurf/mcp_config.json`；Gemini CLI 使用 `GEMINI.md`、`.gemini/skills` 与 `.gemini/settings.json`；Copilot 使用 `.github/copilot-instructions.md`、`.github/skills` 与 `~/.copilot/mcp-config.json`；Cline 使用 `.clinerules`、`.cline/skills` 与 `.cline/mcp_settings.json`；Grok Build 使用项目级 `.grok/rules/*.md`、`.grok/skills/<name>/SKILL.md` 与 `.grok/config.toml` 中的 `[mcp_servers.<name>]`。Codex 和 Claude 的规则会保留现有文件内容，只更新 AgentX 受管区块。
 
 ### Lockfile
 
@@ -113,8 +115,8 @@ agentx diff
 | `agentx doctor` | 检查支持的 Agent 命令或配置目录 |
 | `agentx lock` | 根据当前来源生成或更新 `agentx.lock` |
 | `agentx install` | 安装 Skills、Rules 和 MCP 配置 |
-| `agentx diff` | 比较期望内容与本机安装内容 |
-| `agentx rollback` | 恢复最近一次安装留下的备份 |
+| `agentx diff [--target <target>]` | 比较指定 Agent 的 Skills、Rules 和 MCP 配置与期望内容 |
+| `agentx rollback` | 恢复最近一次安装留下的 Skill、Rules 和 MCP 配置备份 |
 
 默认安装前会询问确认。自动化环境使用 `--yes`，发布或 CI 环境建议同时使用 `--frozen`。
 
