@@ -1,8 +1,8 @@
-//! Ports for external effects. Concrete filesystem/Git adapters remain behind these boundaries.
-use std::path::Path;
-pub trait SourceResolver {
-    fn resolve(&self, source: &str) -> anyhow::Result<std::path::PathBuf>;
-}
-pub trait ArtifactInstaller {
-    fn install(&self, source: &Path, destination: &Path) -> anyhow::Result<()>;
-}
+//! Filesystem, source-control, artifact, and Agent target adapters.
+
+pub(crate) mod artifacts;
+pub(crate) mod filesystem;
+pub(crate) mod installer;
+pub(crate) mod registry;
+pub(crate) mod sources;
+pub(crate) mod targets;

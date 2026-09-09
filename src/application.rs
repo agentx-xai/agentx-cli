@@ -1,188 +1,40 @@
-use crate::interface::SUPPORTED_TARGETS;
+use crate::{
+    domain::{
+        AgentState, Lock, LockedMcp, LockedPackage, LockedRule, Manifest, Mcp, RemotePlan,
+        SUPPORTED_TARGETS, TeamManifestDocument, validate_manifest, validate_package_name,
+        validate_target, validate_team_manifest,
+    },
+    infrastructure::{
+        artifacts::{build_skill_archive, read_skill_archive, security_scan, unpack_skill_archive},
+        filesystem::{
+            operation_nonce, project_path, read_regular_file, root, sha256_dir, sha256_file,
+            write_atomic,
+        },
+        installer::{
+            PlannedChange, PlannedContent, RollbackJournal, apply_agent_plan, apply_install_plan,
+            cleanup_staged_directories, prepare_staged_directories, restore_journal,
+            rollback_agent_files, rollback_journal_path, snapshot_plan, validate_rollback_journal,
+        },
+        registry::RegistryClient,
+        sources::resolve_source,
+        targets::{
+            mcp_summary_path, native_mcp_path, render_managed_rules, render_mcp_native,
+            rule_destination, target_root,
+        },
+    },
+    interface::{AgentCommands, Commands, RegistryCommands, TeamCommands, parse},
+};
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use directories::BaseDirs;
-use reqwest::blocking::{Client, multipart};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use walkdir::WalkDir;
-
-#[derive(Parser)]
-#[command(name = "agentx", about = "Reproducible AI agent environments")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-#[derive(Subcommand)]
-enum Commands {
-    Init,
-    Install {
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        frozen: bool,
-    },
-    Diff {
-        #[arg(long)]
-        target: Option<String>,
-    },
-    Doctor,
-    Lock,
-    Rollback,
-    Registry {
-        #[command(subcommand)]
-        command: RegistryCommands,
-    },
-    Team {
-        #[command(subcommand)]
-        command: TeamCommands,
-    },
-    Agent {
-        #[command(subcommand)]
-        command: AgentCommands,
-    },
-}
-#[derive(Subcommand)]
-enum RegistryCommands {
-    Login {
-        url: String,
-        #[arg(long)]
-        token: String,
-        #[arg(long)]
-        workspace: Option<String>,
-    },
-    Publish {
-        name: String,
-        version: String,
-        file: PathBuf,
-        #[arg(long)]
-        signature: Option<String>,
-    },
-    Pull {
-        name: String,
-        version: String,
-        #[arg(long)]
-        output: PathBuf,
-    },
-}
-#[derive(Subcommand)]
-enum TeamCommands {
-    Pull {
-        #[arg(long, default_value = "agentx.yaml")]
-        output: PathBuf,
-    },
-    Push {
-        #[arg(long, default_value = "agentx.yaml")]
-        input: PathBuf,
-    },
-}
-#[derive(Subcommand)]
-enum AgentCommands {
-    Plan {
-        #[arg(long)]
-        device: String,
-    },
-    Sync {
-        #[arg(long)]
-        device: String,
-    },
-    Rollback {
-        #[arg(long)]
-        device: String,
-    },
-}
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct RegistryCredentials {
-    url: String,
-    token: String,
-    #[serde(default)]
-    workspace_id: Option<String>,
-}
-#[derive(Debug, Deserialize)]
-struct RemoteRelease {
-    name: String,
-    version: String,
-    sha256: String,
-}
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RemoteReleasePage {
-    Legacy(Vec<RemoteRelease>),
-    Paged {
-        items: Vec<RemoteRelease>,
-        #[serde(default)]
-        next_cursor: Option<String>,
-    },
-}
-#[derive(Debug, Deserialize, Serialize)]
-struct Manifest {
-    version: u32,
-    #[serde(default)]
-    skills: Vec<Skill>,
-    #[serde(default)]
-    rules: Vec<Rule>,
-    #[serde(default)]
-    mcp: Vec<Mcp>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-struct Skill {
-    name: String,
-    source: Source,
-    #[serde(default)]
-    targets: Vec<String>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-struct Rule {
-    source: String,
-    #[serde(default)]
-    targets: Vec<String>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-struct Mcp {
-    name: String,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    targets: Vec<String>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type")]
-enum Source {
-    #[serde(rename = "local")]
-    Local { path: String },
-    #[serde(rename = "git")]
-    Git {
-        url: String,
-        #[serde(default)]
-        r#ref: Option<String>,
-    },
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct Lock {
-    version: u32,
-    packages: Vec<LockedPackage>,
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct LockedPackage {
-    name: String,
-    source: String,
-    #[serde(default, rename = "ref")]
-    r#ref: Option<String>,
-    sha256: String,
-}
 
 pub(crate) fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse();
     match cli.command {
         Commands::Init => init(),
         Commands::Install {
@@ -200,138 +52,111 @@ pub(crate) fn run() -> Result<()> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RemotePlan {
-    actions: Vec<RemoteAction>,
-    manifest_revision: i64,
-}
-#[derive(Debug, Deserialize)]
-struct RemoteAction {
-    package: String,
-    kind: String,
-    #[serde(default)]
-    to: String,
-}
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct AgentState {
-    manifest_revision: i64,
-    installed_packages: std::collections::BTreeMap<String, String>,
-}
-
 fn agent(command: AgentCommands) -> Result<()> {
-    let credentials = read_credentials()?;
-    credentials
-        .workspace_id
-        .as_deref()
-        .context("registry credentials require --workspace for agent commands")?;
+    let client = RegistryClient::load()?;
+    client.require_workspace("agent commands")?;
     let device = match &command {
         AgentCommands::Plan { device }
-        | AgentCommands::Sync { device }
-        | AgentCommands::Rollback { device } => device,
+        | AgentCommands::Sync { device, .. }
+        | AgentCommands::Rollback { device, .. } => device.clone(),
     };
-    let state_dir = root()?.join(".agentx/devices").join(device);
+    crate::domain::validate_device_name(&device)?;
+    let state_dir = root()?.join(".agentx/devices").join(&device);
     fs::create_dir_all(&state_dir)?;
     let state_path = state_dir.join("state.json");
     let backup_path = state_dir.join("previous.json");
-    let client = Client::new();
     match command {
         AgentCommands::Plan { .. } => {
-            let response = client
-                .get(format!(
-                    "{}{}/devices/{}/plan",
-                    credentials.url,
-                    workspace_prefix(&credentials),
-                    device
-                ))
-                .bearer_auth(&credentials.token)
-                .send()?;
-            if !response.status().is_success() {
-                bail!("reconcile plan failed ({})", response.status());
-            }
-            let plan: RemotePlan = response.json().context("invalid reconcile plan")?;
+            let plan = client.reconcile_plan(&device)?;
             println!("manifest revision {}", plan.manifest_revision);
             for action in plan.actions {
                 println!("{} {} {}", action.kind, action.package, action.to);
             }
         }
-        AgentCommands::Sync { .. } => {
-            let response = client
-                .get(format!(
-                    "{}{}/devices/{}/plan",
-                    credentials.url,
-                    workspace_prefix(&credentials),
-                    device
-                ))
-                .bearer_auth(&credentials.token)
-                .send()?;
-            if !response.status().is_success() {
-                bail!("reconcile plan failed ({})", response.status());
-            }
-            let plan: RemotePlan = response.json().context("invalid reconcile plan")?;
+        AgentCommands::Sync { target, .. } => {
+            validate_target(&target)?;
+            let plan: RemotePlan = client.reconcile_plan(&device)?;
             let old: AgentState = fs::read_to_string(&state_path)
                 .ok()
                 .and_then(|raw| serde_json::from_str(&raw).ok())
                 .unwrap_or_default();
-            fs::write(&backup_path, serde_json::to_vec_pretty(&old)?)?;
-            let mut installed = old.installed_packages;
+            if let Some(previous_target) = &old.target {
+                if previous_target != &target && !old.installed_packages.is_empty() {
+                    bail!(
+                        "device state belongs to target {previous_target}; use --target {previous_target}"
+                    );
+                }
+            }
+            if plan.actions.is_empty() {
+                client.heartbeat(&device, &old.installed_packages)?;
+                println!(
+                    "device {} already matches manifest revision {}",
+                    device, plan.manifest_revision
+                );
+                return Ok(());
+            }
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let staging = state_dir.join(format!("staging-{stamp}"));
+            fs::create_dir_all(&staging)?;
+            let cache = state_dir.join("artifacts");
+            fs::create_dir_all(&cache)?;
+            let mut installed = old.installed_packages.clone();
             for action in &plan.actions {
+                validate_package_name(&action.package)?;
                 match action.kind.as_str() {
                     "remove" => {
                         installed.remove(&action.package);
                     }
                     "install" | "update" => {
-                        let artifact = client
-                            .get(format!(
-                                "{}{}/artifacts/{}",
-                                credentials.url,
-                                workspace_prefix(&credentials),
-                                action.to
-                            ))
-                            .bearer_auth(&credentials.token)
-                            .send()?;
-                        if !artifact.status().is_success() {
-                            bail!(
-                                "artifact download failed for {} ({})",
-                                action.package,
-                                artifact.status()
-                            );
-                        }
-                        let bytes = artifact.bytes()?;
-                        let actual = format!("{:x}", Sha256::digest(&bytes));
-                        if actual != action.to {
-                            bail!(
-                                "artifact hash mismatch for {}: expected {}, got {}",
-                                action.package,
-                                action.to,
-                                actual
-                            );
-                        }
-                        let cache = state_dir.join("artifacts");
-                        fs::create_dir_all(&cache)?;
-                        fs::write(cache.join(&action.to), &bytes)?;
+                        let bytes = client.download_artifact(&action.to)?;
+                        let cached = cache.join(&action.to);
+                        write_atomic(&cached, &bytes)?;
+                        unpack_skill_archive(&bytes, &staging.join(&action.package))?;
                         installed.insert(action.package.clone(), action.to.clone());
                     }
                     _ => bail!("unsupported reconcile action {}", action.kind),
                 }
             }
+            write_atomic(&backup_path, &serde_json::to_vec_pretty(&old)?)?;
+            if let Err(err) = apply_agent_plan(&target, &plan.actions, &staging) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(err);
+            }
+            let _ = fs::remove_dir_all(&staging);
             let new_state = AgentState {
                 manifest_revision: plan.manifest_revision,
                 installed_packages: installed.clone(),
+                target: Some(target),
+                changed_packages: plan
+                    .actions
+                    .iter()
+                    .map(|action| action.package.clone())
+                    .collect(),
             };
-            fs::write(&state_path, serde_json::to_vec_pretty(&new_state)?)?;
-            heartbeat(&client, &credentials, device, &installed)?;
+            write_atomic(&state_path, &serde_json::to_vec_pretty(&new_state)?)?;
+            client.heartbeat(&device, &installed)?;
             println!(
                 "synced device {} to manifest revision {}",
                 device, plan.manifest_revision
             );
         }
-        AgentCommands::Rollback { .. } => {
-            let previous: AgentState = serde_json::from_str(
+        AgentCommands::Rollback { target, .. } => {
+            validate_target(&target)?;
+            let current: AgentState = serde_json::from_str(
+                &fs::read_to_string(&state_path).context("no current agent state to roll back")?,
+            )?;
+            let mut previous: AgentState = serde_json::from_str(
                 &fs::read_to_string(&backup_path)
                     .context("no previous agent state to roll back")?,
             )?;
-            fs::write(&state_path, serde_json::to_vec_pretty(&previous)?)?;
-            heartbeat(&client, &credentials, device, &previous.installed_packages)?;
+            if current.target.as_deref() != Some(target.as_str()) {
+                bail!("current device state does not belong to target {target}");
+            }
+            rollback_agent_files(&target, &current.changed_packages)?;
+            previous.target = Some(target);
+            previous.changed_packages.clear();
+            write_atomic(&state_path, &serde_json::to_vec_pretty(&previous)?)?;
+            client.heartbeat(&device, &previous.installed_packages)?;
             println!(
                 "rolled back device {} to manifest revision {}",
                 device, previous.manifest_revision
@@ -340,115 +165,81 @@ fn agent(command: AgentCommands) -> Result<()> {
     }
     Ok(())
 }
-
-fn heartbeat(
-    client: &Client,
-    credentials: &RegistryCredentials,
-    device: &str,
-    installed: &std::collections::BTreeMap<String, String>,
-) -> Result<()> {
-    let response = client
-        .post(format!(
-            "{}{}/devices/{}/heartbeat",
-            credentials.url,
-            workspace_prefix(credentials),
-            device
-        ))
-        .bearer_auth(&credentials.token)
-        .json(&serde_json::json!({"agent":"agentx","installed_packages":installed}))
-        .send()?;
-    if !response.status().is_success() {
-        bail!("heartbeat failed ({})", response.status());
-    }
-    Ok(())
-}
 fn team(command: TeamCommands) -> Result<()> {
-    let credentials = read_credentials()?;
-    let client = Client::new();
-    let workspace = credentials
-        .workspace_id
-        .as_deref()
-        .context("registry credentials require --workspace for team commands")?;
+    let client = RegistryClient::load()?;
+    client.require_workspace("team commands")?;
     match command {
         TeamCommands::Pull { output } => {
-            let response = client
-                .get(format!(
-                    "{}/v1/workspaces/{}/manifest",
-                    credentials.url, workspace
-                ))
-                .bearer_auth(&credentials.token)
-                .send()?;
-            if !response.status().is_success() {
-                bail!("team manifest pull failed ({})", response.status())
-            }
-            let body: serde_json::Value = response.json()?;
-            let document = body.get("document").cloned().unwrap_or(body);
+            let document = client.fetch_team_manifest()?;
+            validate_team_manifest(&document)?;
             let raw = serde_yaml::to_string(&document).context("manifest is not serializable")?;
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&output, raw)?;
+            write_atomic(&output, raw.as_bytes())?;
             println!("pulled team manifest -> {}", output.display());
             Ok(())
         }
         TeamCommands::Push { input } => {
             let raw = fs::read_to_string(&input)
                 .with_context(|| format!("cannot read {}", input.display()))?;
-            let document: serde_json::Value =
+            let document: TeamManifestDocument =
                 serde_yaml::from_str(&raw).context("invalid team manifest YAML")?;
-            let response = client
-                .put(format!(
-                    "{}/v1/workspaces/{}/manifest",
-                    credentials.url, workspace
-                ))
-                .bearer_auth(&credentials.token)
-                .json(&serde_json::json!({"document": document}))
-                .send()?;
-            if !response.status().is_success() {
-                bail!("team manifest push failed ({})", response.status())
-            }
-            let revision = response
-                .json::<serde_json::Value>()?
-                .get("revision")
-                .and_then(|value| value.as_i64())
-                .unwrap_or_default();
+            validate_team_manifest(&document)?;
+            let revision = client.replace_team_manifest(&document)?;
             println!("pushed team manifest revision {}", revision);
             Ok(())
         }
     }
-}
-fn credentials_path() -> Result<PathBuf> {
-    let dirs = BaseDirs::new().context("cannot find home directory")?;
-    Ok(dirs.config_dir().join("agentx/credentials.json"))
-}
-fn read_credentials() -> Result<RegistryCredentials> {
-    let p = credentials_path()?;
-    let raw = fs::read_to_string(&p).with_context(|| {
-        format!(
-            "not logged in; run `agentx registry login <url> --token <token>` ({})",
-            p.display()
-        )
-    })?;
-    Ok(serde_json::from_str(&raw)?)
 }
 fn registry(command: RegistryCommands) -> Result<()> {
     match command {
         RegistryCommands::Login {
             url,
             token,
+            token_stdin,
+            oidc,
             workspace,
         } => {
-            let p = credentials_path()?;
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent)?
+            let path = if oidc {
+                let authorization = RegistryClient::start_oidc_device_login(&url, workspace)?;
+                println!("Open this URL in a browser:");
+                println!("{}", authorization.verification_url());
+                println!("Confirm code: {}", authorization.user_code());
+                io::stdout()
+                    .flush()
+                    .context("cannot flush OIDC login instructions")?;
+                authorization.finish()?
+            } else {
+                let token = if let Some(token) = token {
+                    token
+                } else if token_stdin {
+                    let mut value = String::new();
+                    io::stdin()
+                        .read_to_string(&mut value)
+                        .context("cannot read Registry token from stdin")?;
+                    value.trim_end_matches(['\r', '\n']).to_string()
+                } else {
+                    std::env::var("AGENTX_TOKEN").context(
+                        "provide --oidc, --token-stdin, --token, or the AGENTX_TOKEN environment variable",
+                    )?
+                };
+                RegistryClient::save_login(&url, &token, workspace)?
             };
-            let c = RegistryCredentials {
-                url: url.trim_end_matches('/').to_string(),
-                token,
-                workspace_id: workspace,
-            };
-            fs::write(&p, serde_json::to_vec_pretty(&c)?)?;
-            println!("saved Registry credentials to {}", p.display());
+            println!("saved Registry credentials to {}", path.display());
+            Ok(())
+        }
+        RegistryCommands::Workspaces => {
+            for workspace in RegistryClient::load()?.list_workspaces()? {
+                println!("{}\t{}\t{}", workspace.id, workspace.slug, workspace.name);
+            }
+            Ok(())
+        }
+        RegistryCommands::Use { workspace } => {
+            let path = RegistryClient::select_workspace(&workspace)?;
+            println!("selected workspace {} in {}", workspace, path.display());
+            Ok(())
+        }
+        RegistryCommands::Logout => {
+            let path = RegistryClient::logout()?;
+            println!("removed Registry credentials from {}", path.display());
             Ok(())
         }
         RegistryCommands::Publish {
@@ -457,57 +248,22 @@ fn registry(command: RegistryCommands) -> Result<()> {
             file,
             signature,
         } => {
-            let c = read_credentials()?;
-            let bytes =
-                fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
-            let digest = format!("{:x}", Sha256::digest(&bytes));
-            let mut form = multipart::Form::new()
-                .text("version", version.clone())
-                .part(
-                    "artifact",
-                    multipart::Part::bytes(bytes).file_name(
-                        file.file_name()
-                            .and_then(|x| x.to_str())
-                            .unwrap_or("artifact")
-                            .to_string(),
-                    ),
-                );
-            if let Some(sig) = signature {
-                form = form.text("signature", sig)
+            validate_package_name(&name)?;
+            semver::Version::parse(&version).context("package version must be SemVer")?;
+            let bytes = if file.is_dir() {
+                build_skill_archive(&file)?
+            } else {
+                let bytes =
+                    fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
+                read_skill_archive(&bytes)?;
+                bytes
             };
-            let response = Client::new()
-                .post(format!(
-                    "{}{}/packages/{}/releases",
-                    c.url,
-                    workspace_prefix(&c),
-                    name
-                ))
-                .bearer_auth(c.token)
-                .header(
-                    "Idempotency-Key",
-                    format!("{}@{}:{}", name, version, digest),
-                )
-                .multipart(form)
-                .send()?;
-            if !response.status().is_success() {
-                bail!(
-                    "publish failed ({}): {}",
-                    response.status(),
-                    response.text().unwrap_or_default()
-                )
-            };
-            let release: RemoteRelease = response.json().context("invalid publish response")?;
-            if release.name != name || release.version != version || release.sha256 != digest {
-                bail!(
-                    "publish response mismatch: expected {}@{} {}, got {}@{} {}",
-                    name,
-                    version,
-                    digest,
-                    release.name,
-                    release.version,
-                    release.sha256
-                )
-            }
+            let file_name = file
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("artifact");
+            let digest =
+                RegistryClient::load()?.publish(&name, &version, file_name, bytes, signature)?;
             println!("published {}@{} (sha256 {})", name, version, digest);
             Ok(())
         }
@@ -516,85 +272,15 @@ fn registry(command: RegistryCommands) -> Result<()> {
             version,
             output,
         } => {
-            let c = read_credentials()?;
-            let releases = list_remote_releases(&c)?;
-            let release = releases
-                .into_iter()
-                .find(|r| r.name == name && r.version == version)
-                .context("release not found")?;
-            let body = Client::new()
-                .get(format!(
-                    "{}{}/artifacts/{}",
-                    c.url,
-                    workspace_prefix(&c),
-                    release.sha256
-                ))
-                .bearer_auth(c.token)
-                .send()?;
-            if !body.status().is_success() {
-                bail!("artifact download failed ({})", body.status())
-            };
-            let bytes = body.bytes()?;
-            let actual = format!("{:x}", Sha256::digest(&bytes));
-            if actual != release.sha256 {
-                bail!(
-                    "artifact hash mismatch: expected {}, got {}",
-                    release.sha256,
-                    actual
-                )
-            };
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)?
-            };
-            fs::write(&output, &bytes)?;
+            validate_package_name(&name)?;
+            semver::Version::parse(&version).context("package version must be SemVer")?;
+            let bytes = RegistryClient::load()?.pull(&name, &version)?;
+            read_skill_archive(&bytes)?;
+            write_atomic(&output, &bytes)?;
             println!("downloaded {}@{} -> {}", name, version, output.display());
             Ok(())
         }
     }
-}
-fn list_remote_releases(credentials: &RegistryCredentials) -> Result<Vec<RemoteRelease>> {
-    let client = Client::new();
-    let mut cursor: Option<String> = None;
-    let mut releases = Vec::new();
-    loop {
-        let mut url = format!(
-            "{}{}/packages?limit=200",
-            credentials.url,
-            workspace_prefix(credentials)
-        );
-        if let Some(value) = &cursor {
-            url.push_str("&cursor=");
-            url.push_str(value);
-        }
-        let response = client.get(url).bearer_auth(&credentials.token).send()?;
-        if !response.status().is_success() {
-            bail!("package listing failed ({})", response.status())
-        }
-        match response.json::<RemoteReleasePage>()? {
-            RemoteReleasePage::Legacy(items) => {
-                releases.extend(items);
-                break;
-            }
-            RemoteReleasePage::Paged { items, next_cursor } => {
-                releases.extend(items);
-                match next_cursor {
-                    Some(value) if !value.is_empty() => cursor = Some(value),
-                    _ => break,
-                }
-            }
-        }
-    }
-    Ok(releases)
-}
-fn workspace_prefix(credentials: &RegistryCredentials) -> String {
-    credentials
-        .workspace_id
-        .as_deref()
-        .map(|id| format!("/v1/workspaces/{}", id))
-        .unwrap_or_else(|| "/v1".to_string())
-}
-fn root() -> Result<PathBuf> {
-    std::env::current_dir().context("cannot determine current directory")
 }
 fn load_manifest() -> Result<Manifest> {
     let path = root()?.join("agentx.yaml");
@@ -604,6 +290,7 @@ fn load_manifest() -> Result<Manifest> {
     if m.version != 1 {
         bail!("unsupported manifest version {}", m.version);
     }
+    validate_manifest(&m)?;
     Ok(m)
 }
 fn init() -> Result<()> {
@@ -615,118 +302,221 @@ fn init() -> Result<()> {
     println!("created {}", path.display());
     Ok(())
 }
-fn source_path(source: &Source) -> Result<PathBuf> {
-    match source {
-        Source::Local { path } => {
-            let p = safe_project_path(path, "skill source")?;
-            if !p.is_dir() {
-                bail!("skill source is not a directory: {}", p.display());
-            }
-            Ok(p)
+
+fn resolve_manifest(m: &Manifest) -> Result<(Lock, BTreeMap<String, PathBuf>)> {
+    let mut packages = Vec::new();
+    let mut sources = BTreeMap::new();
+    for skill in &m.skills {
+        let resolved = resolve_source(&skill.source)?;
+        if !resolved.path.join("SKILL.md").is_file() {
+            bail!("skill {:?} must contain a root SKILL.md", skill.name);
         }
-        Source::Git { url, r#ref } => {
-            let reference = r#ref
-                .as_deref()
-                .context("git skill sources require a fixed ref")?;
-            let mut key = Sha256::new();
-            key.update(url.as_bytes());
-            key.update([0]);
-            key.update(reference.as_bytes());
-            let cache = root()?
-                .join(".agentx/cache/git")
-                .join(format!("{:x}", key.finalize()));
-            if cache.is_dir() {
-                let metadata = cache.join(".git");
-                if metadata.exists() {
-                    remove_path(&metadata)?;
-                }
-                return Ok(cache);
-            }
-            let parent = cache.parent().context("invalid git cache path")?;
-            fs::create_dir_all(parent)?;
-            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let temp = parent.join(format!("clone-{stamp}"));
-            let mut cmd = Command::new("git");
-            cmd.args(["clone", "--depth", "1", "--branch", reference]);
-            cmd.args([url, temp.to_str().context("invalid temp path")?]);
-            let status = cmd.status().context("git is required for git sources")?;
-            if !status.success() {
-                let _ = fs::remove_dir_all(&temp);
-                bail!("failed to clone skill source {url}@{reference}");
-            }
-            let metadata = temp.join(".git");
-            if metadata.exists() {
-                remove_path(&metadata)?;
-            }
-            fs::rename(&temp, &cache)?;
-            Ok(cache)
-        }
+        security_scan(&resolved.path)?;
+        packages.push(LockedPackage {
+            name: skill.name.clone(),
+            source: resolved.source,
+            r#ref: resolved.requested_ref,
+            revision: resolved.revision,
+            sha256: sha256_dir(&resolved.path)?,
+        });
+        sources.insert(skill.name.clone(), resolved.path);
     }
+    let mut rules = Vec::new();
+    for rule in &m.rules {
+        let path = project_path(&rule.source, "rule source", false)?;
+        rules.push(LockedRule {
+            source: rule.source.clone(),
+            targets: rule.targets.clone(),
+            sha256: sha256_file(&path)?,
+        });
+    }
+    let mcp = m
+        .mcp
+        .iter()
+        .map(|entry| LockedMcp {
+            name: entry.name.clone(),
+            command: entry.command.clone(),
+            args: entry.args.clone(),
+            targets: entry.targets.clone(),
+        })
+        .collect();
+    Ok((
+        Lock {
+            version: 2,
+            packages,
+            rules,
+            mcp,
+        },
+        sources,
+    ))
 }
 
-fn safe_project_path(value: &str, label: &str) -> Result<PathBuf> {
-    let relative = Path::new(value);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        bail!("{label} must stay inside the project: {value}");
+fn planned_rule_change(m: &Manifest, target: &str) -> Result<Option<PlannedChange>> {
+    let mut text = String::new();
+    for rule in &m.rules {
+        if rule.targets.is_empty() || rule.targets.iter().any(|value| value == target) {
+            let path = project_path(&rule.source, "rule source", false)?;
+            text.push_str(
+                &fs::read_to_string(&path)
+                    .with_context(|| format!("rule source must be UTF-8: {}", path.display()))?,
+            );
+            text.push_str("\n\n");
+        }
     }
-    Ok(root()?.join(relative))
-}
-
-fn safe_name(value: &str, label: &str) -> Result<()> {
-    let path = Path::new(value);
-    if value.trim().is_empty()
-        || path.is_absolute()
-        || path.components().count() != 1
-        || !matches!(
-            path.components().next(),
-            Some(std::path::Component::Normal(_))
+    let text = text.trim_end().to_string();
+    let (destination, shared) = rule_destination(target)?;
+    let existing = read_regular_file(&destination)?;
+    let desired = if shared {
+        let current = match &existing {
+            Some(bytes) => std::str::from_utf8(bytes).with_context(|| {
+                format!(
+                    "managed rules file must be UTF-8: {}",
+                    destination.display()
+                )
+            })?,
+            None => "",
+        };
+        Some(render_managed_rules(current, &text)?.into_bytes())
+    } else if text.is_empty() {
+        None
+    } else if target == "cursor" {
+        Some(
+            format!(
+                "---\ndescription: AgentX managed project rules\nalwaysApply: true\n---\n\n{text}\n"
+            )
+            .into_bytes(),
         )
-    {
-        bail!("{label} must be a single safe path component: {value}");
+    } else {
+        Some(format!("{text}\n").into_bytes())
+    };
+    match (&existing, &desired) {
+        (None, None) => Ok(None),
+        (Some(current), Some(next)) if current == next => Ok(None),
+        (None, Some(next)) if next.is_empty() => Ok(None),
+        _ => Ok(Some(PlannedChange {
+            destination,
+            content: desired.map_or(PlannedContent::Absent, PlannedContent::File),
+            description: format!("{target} rules"),
+        })),
     }
-    Ok(())
 }
-fn sha256_dir(path: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    for entry in WalkDir::new(path).follow_links(false) {
-        let e = entry?;
-        if e.file_type().is_file() {
-            files.push(e.path().to_path_buf());
+
+fn planned_mcp_changes(m: &Manifest, target: &str) -> Result<Vec<PlannedChange>> {
+    let selected: Vec<_> = m
+        .mcp
+        .iter()
+        .filter(|entry| {
+            entry.targets.is_empty() || entry.targets.iter().any(|value| value == target)
+        })
+        .collect();
+    let summary_path = mcp_summary_path(target)?;
+    let previous_summary = read_regular_file(&summary_path)?;
+    let previous_entries: Vec<Mcp> = match &previous_summary {
+        Some(bytes) => serde_json::from_slice(bytes)
+            .with_context(|| format!("invalid AgentX MCP summary: {}", summary_path.display()))?,
+        None => Vec::new(),
+    };
+    let previous: BTreeSet<_> = previous_entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    if selected.is_empty() && previous.is_empty() {
+        return Ok(Vec::new());
+    }
+    let native_path = native_mcp_path(target)?;
+    let existing_native = read_regular_file(&native_path)?;
+    let desired_native =
+        render_mcp_native(target, existing_native.as_deref(), &previous, &selected)?;
+    let summary = selected
+        .iter()
+        .map(|entry| {
+            serde_json::json!({"name": entry.name, "command": entry.command, "args": entry.args})
+        })
+        .collect::<Vec<_>>();
+    let desired_summary = serde_json::to_vec_pretty(&summary)?;
+    let mut changes = Vec::new();
+    if existing_native.as_deref() != Some(desired_native.as_slice()) {
+        changes.push(PlannedChange {
+            destination: native_path,
+            content: PlannedContent::File(desired_native),
+            description: format!("{target} MCP configuration"),
+        });
+    }
+    if previous_summary.as_deref() != Some(desired_summary.as_slice()) {
+        changes.push(PlannedChange {
+            destination: summary_path,
+            content: PlannedContent::File(desired_summary),
+            description: format!("{target} AgentX MCP ownership record"),
+        });
+    }
+    Ok(changes)
+}
+
+fn build_install_plan(
+    m: &Manifest,
+    targets: &[String],
+    sources: &BTreeMap<String, PathBuf>,
+    lock: &Lock,
+) -> Result<Vec<PlannedChange>> {
+    let mut plan = Vec::new();
+    let mut destinations = BTreeSet::new();
+    for target in targets {
+        let destination_root = target_root(target)?;
+        for skill in &m.skills {
+            if !skill.targets.is_empty() && !skill.targets.iter().any(|value| value == target) {
+                continue;
+            }
+            let destination = destination_root.join(&skill.name);
+            if !destinations.insert(destination.clone()) {
+                bail!(
+                    "multiple install operations target {}",
+                    destination.display()
+                );
+            }
+            plan.push(PlannedChange {
+                destination,
+                content: PlannedContent::Directory(
+                    sources
+                        .get(&skill.name)
+                        .context("resolved skill source is missing")?
+                        .clone(),
+                ),
+                description: format!("{target} skill {}", skill.name),
+            });
+        }
+        if let Some(change) = planned_rule_change(m, target)? {
+            if !destinations.insert(change.destination.clone()) {
+                bail!(
+                    "multiple install operations target {}",
+                    change.destination.display()
+                );
+            }
+            plan.push(change);
+        }
+        for change in planned_mcp_changes(m, target)? {
+            if !destinations.insert(change.destination.clone()) {
+                bail!(
+                    "multiple install operations target {}",
+                    change.destination.display()
+                );
+            }
+            plan.push(change);
         }
     }
-    files.sort();
-    let mut h = Sha256::new();
-    for file in files {
-        h.update(file.strip_prefix(path)?.to_string_lossy().as_bytes());
-        h.update(fs::read(file)?);
+    let lock_path = root()?.join("agentx.lock");
+    if !destinations.insert(lock_path.clone()) {
+        bail!("multiple install operations target {}", lock_path.display());
     }
-    Ok(format!("{:x}", h.finalize()))
+    plan.push(PlannedChange {
+        destination: lock_path,
+        content: PlannedContent::File(serde_yaml::to_string(lock)?.into_bytes()),
+        description: "lockfile".into(),
+    });
+    Ok(plan)
 }
-fn target_root(target: &str) -> Result<PathBuf> {
-    let dirs = BaseDirs::new().context("cannot find home directory")?;
-    let home = dirs.home_dir();
-    match target {
-        "codex" => Ok(home.join(".codex/skills")),
-        "claude" => Ok(home.join(".claude/skills")),
-        "cursor" => Ok(root()?.join(".cursor/skills")),
-        "windsurf" => Ok(root()?.join(".windsurf/skills")),
-        "gemini" => Ok(root()?.join(".gemini/skills")),
-        "copilot" => Ok(root()?.join(".github/skills")),
-        "cline" => Ok(root()?.join(".cline/skills")),
-        "grok" => Ok(root()?.join(".grok/skills")),
-        _ => bail!(
-            "unsupported target {target}; use {}",
-            SUPPORTED_TARGETS.join(", ")
-        ),
-    }
-}
+
 fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
     let m = load_manifest()?;
-    validate_manifest_targets(&m)?;
     let targets = target
         .map(|x| vec![x.to_string()])
         .unwrap_or_else(|| vec!["codex".into(), "claude".into()]);
@@ -738,111 +528,47 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
             );
         }
     }
-    for skill in &m.skills {
-        safe_name(&skill.name, "skill name")?;
-    }
-    for mcp in &m.mcp {
-        safe_name(&mcp.name, "MCP name")?;
-        if mcp.command.trim().is_empty() {
-            bail!("MCP command cannot be empty: {}", mcp.name);
-        }
-    }
-    for rule in &m.rules {
-        let source = safe_project_path(&rule.source, "rule source")?;
-        if !source.is_file() {
-            bail!("rule source is not a file: {}", source.display());
-        }
-        security_scan(&source)?;
-    }
-    let mut lock = Lock {
-        version: 1,
-        packages: Vec::new(),
-    };
-    for skill in &m.skills {
-        let source = source_path(&skill.source)?;
-        security_scan(&source)?;
-        let source_text = match &skill.source {
-            Source::Local { path } => path.clone(),
-            Source::Git { url, .. } => url.clone(),
-        };
-        lock.packages.push(LockedPackage {
-            name: skill.name.clone(),
-            source: source_text,
-            r#ref: match &skill.source {
-                Source::Git { r#ref, .. } => r#ref.clone(),
-                Source::Local { .. } => None,
-            },
-            sha256: sha256_dir(&source)?,
-        });
-    }
+    let (mut lock, sources) = resolve_manifest(&m)?;
     let lock_path = root()?.join("agentx.lock");
     if frozen && lock_path.exists() {
         let existing: Lock = serde_yaml::from_str(&fs::read_to_string(&lock_path)?)?;
-        if existing.packages.len() != lock.packages.len()
-            || existing.packages.iter().zip(&lock.packages).any(|(a, b)| {
-                a.name != b.name
-                    || a.source != b.source
-                    || a.r#ref != b.r#ref
-                    || a.sha256 != b.sha256
-            })
-        {
+        if existing != lock {
             bail!("lockfile does not match sources; run `agentx lock` first");
         }
         lock = existing;
     } else if frozen {
         bail!("agentx.lock is required with --frozen");
     }
+    let plan = build_install_plan(&m, &targets, &sources, &lock)?;
+    let journal_path = rollback_journal_path()?;
+    let previous = read_regular_file(&journal_path)?
+        .map(|bytes| serde_json::from_slice::<RollbackJournal>(&bytes))
+        .transpose()
+        .context("invalid previous rollback journal")?;
+    if let Some(journal) = &previous {
+        validate_rollback_journal(journal)?;
+    }
     if !yes {
-        println!("Install plan:");
-        for t in &targets {
-            println!("  {t}:");
-            let skill_root = target_root(t)?;
-            for skill in m
-                .skills
-                .iter()
-                .filter(|skill| skill.targets.is_empty() || skill.targets.iter().any(|x| x == t))
-            {
-                println!(
-                    "    skill {}: {} -> {}",
-                    skill.name,
-                    source_display(&skill.source),
-                    skill_root.join(&skill.name).display()
-                );
-            }
-            let rules = m
-                .rules
-                .iter()
-                .filter(|rule| rule.targets.is_empty() || rule.targets.iter().any(|x| x == t))
-                .map(|rule| rule.source.as_str())
-                .collect::<Vec<_>>();
-            if !rules.is_empty() {
-                println!(
-                    "    rules [{}] -> {}",
-                    rules.join(", "),
-                    managed_rule_path(t)?.display()
-                );
-            }
-            for server in m
-                .mcp
-                .iter()
-                .filter(|server| server.targets.is_empty() || server.targets.iter().any(|x| x == t))
-            {
-                let environment = environment_references(server);
-                println!(
-                    "    MCP {}: command {:?}; args {:?}; environment refs [{}]; target {}",
-                    server.name,
-                    server.command,
-                    server.args,
-                    environment.join(", "),
-                    managed_mcp_paths(t)?
-                        .into_iter()
-                        .next()
-                        .context("missing managed MCP path")?
-                        .display()
-                );
+        println!("planned changes:");
+        for change in &plan {
+            println!(
+                "  {} -> {}",
+                change.description,
+                change.destination.display()
+            );
+        }
+        for target in &targets {
+            for mcp in &m.mcp {
+                if mcp.targets.is_empty() || mcp.targets.iter().any(|value| value == target) {
+                    println!(
+                        "  {target} MCP command: {} {}",
+                        mcp.command,
+                        mcp.args.join(" ")
+                    );
+                }
             }
         }
-        println!("install the plan above? [y/N]");
+        println!("apply {} change(s)? [y/N]", plan.len());
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {
@@ -850,866 +576,198 @@ fn install(target: Option<&str>, yes: bool, frozen: bool) -> Result<()> {
             return Ok(());
         }
     }
-    for t in &targets {
-        let dest = target_root(t)?;
-        fs::create_dir_all(&dest)?;
-        for skill in &m.skills {
-            if !skill.targets.is_empty() && !skill.targets.iter().any(|x| x == t) {
-                continue;
-            }
-            let src = source_path(&skill.source)?;
-            security_scan(&src)?;
-            let out = dest.join(&skill.name);
-            if out.exists() {
-                let marker = created_marker_path(&out);
-                if marker.exists() {
-                    fs::remove_file(marker)?;
-                }
-                let backup = backup_path(&out);
-                if backup.exists() {
-                    remove_path(&backup)?;
-                }
-                fs::rename(&out, &backup)?;
-            } else {
-                fs::write(created_marker_path(&out), b"")?;
-            }
-            copy_dir(&src, &out)?;
-            println!("installed {} -> {}", skill.name, out.display());
+    let nonce = operation_nonce()?;
+    let staged = prepare_staged_directories(&plan, &nonce)?;
+    let journal = match snapshot_plan(&plan, &nonce) {
+        Ok(journal) => journal,
+        Err(error) => {
+            cleanup_staged_directories(&staged);
+            let _ = fs::remove_dir_all(root()?.join(".agentx/backups").join(&nonce));
+            return Err(error);
         }
-        install_rules(&m, t)?;
-        install_mcp(&m, t)?;
-        for mcp in &m.mcp {
-            if mcp.targets.is_empty() || mcp.targets.iter().any(|x| x == t) {
-                println!("MCP declared: {} ({})", mcp.name, mcp.command);
+    };
+    if let Err(error) = apply_install_plan(&plan, &staged, &nonce) {
+        cleanup_staged_directories(&staged);
+        let restore = restore_journal(&journal, &format!("failed-{nonce}"));
+        return match restore {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&journal.backup_root);
+                Err(error.context("installation failed; previous state restored"))
             }
+            Err(restore_error) => Err(error.context(format!(
+                "installation failed and automatic rollback also failed; recovery data remains at {}: {restore_error:#}",
+                journal.backup_root.display()
+            ))),
+        };
+    }
+    cleanup_staged_directories(&staged);
+    if let Err(error) = write_atomic(&journal_path, &serde_json::to_vec_pretty(&journal)?) {
+        return match restore_journal(&journal, &format!("journal-failed-{nonce}")) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&journal.backup_root);
+                Err(error.context("could not save rollback journal; previous state restored"))
+            }
+            Err(restore_error) => Err(error.context(format!(
+                "could not save rollback journal and automatic rollback failed; recovery data remains at {}: {restore_error:#}",
+                journal.backup_root.display()
+            ))),
+        };
+    }
+    if let Some(previous) = previous {
+        if previous.backup_root != journal.backup_root
+            && previous
+                .backup_root
+                .starts_with(root()?.join(".agentx/backups"))
+        {
+            let _ = fs::remove_dir_all(previous.backup_root);
         }
     }
-    fs::write(lock_path, serde_yaml::to_string(&lock)?)?;
+    for change in &plan {
+        println!(
+            "installed {} -> {}",
+            change.description,
+            change.destination.display()
+        );
+    }
     Ok(())
 }
-
-fn validate_manifest_targets(m: &Manifest) -> Result<()> {
-    for target in m
-        .skills
-        .iter()
-        .flat_map(|item| item.targets.iter())
-        .chain(m.rules.iter().flat_map(|item| item.targets.iter()))
-        .chain(m.mcp.iter().flat_map(|item| item.targets.iter()))
-    {
-        if !SUPPORTED_TARGETS.contains(&target.as_str()) {
-            bail!(
-                "unsupported target {target}; use {}",
-                SUPPORTED_TARGETS.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-fn source_display(source: &Source) -> String {
-    match source {
-        Source::Local { path } => path.clone(),
-        Source::Git { url, r#ref } => {
-            format!("{}@{}", url, r#ref.as_deref().unwrap_or("<missing-ref>"))
-        }
-    }
-}
-
-fn environment_references(mcp: &Mcp) -> Vec<String> {
-    let mut references = Vec::new();
-    for value in std::iter::once(&mcp.command).chain(mcp.args.iter()) {
-        let bytes = value.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'$' {
-                let braced = bytes.get(index + 1) == Some(&b'{');
-                let start = index + if braced { 2 } else { 1 };
-                let mut end = start;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-                {
-                    end += 1;
-                }
-                if end > start && (!braced || bytes.get(end) == Some(&b'}')) {
-                    let name = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-                    if !references.contains(&name) {
-                        references.push(name);
-                    }
-                }
-                index = end;
-            } else {
-                index += 1;
-            }
-        }
-    }
-    references.sort();
-    references
-}
-
 fn lock_manifest() -> Result<()> {
     let m = load_manifest()?;
-    validate_manifest_targets(&m)?;
-    let mut packages = Vec::new();
-    for skill in &m.skills {
-        safe_name(&skill.name, "skill name")?;
-        let path = source_path(&skill.source)?;
-        security_scan(&path)?;
-        let source = match &skill.source {
-            Source::Local { path } => path.clone(),
-            Source::Git { url, .. } => url.clone(),
-        };
-        packages.push(LockedPackage {
-            name: skill.name.clone(),
-            source,
-            r#ref: match &skill.source {
-                Source::Git { r#ref, .. } => r#ref.clone(),
-                Source::Local { .. } => None,
-            },
-            sha256: sha256_dir(&path)?,
-        });
-    }
-    fs::write(
-        root()?.join("agentx.lock"),
-        serde_yaml::to_string(&Lock {
-            version: 1,
-            packages,
-        })?,
-    )?;
+    let (lock, _) = resolve_manifest(&m)?;
+    fs::write(root()?.join("agentx.lock"), serde_yaml::to_string(&lock)?)?;
     println!("wrote agentx.lock");
     Ok(())
 }
-fn install_mcp(m: &Manifest, target: &str) -> Result<()> {
-    let selected: Vec<_> = m
-        .mcp
-        .iter()
-        .filter(|x| x.targets.is_empty() || x.targets.iter().any(|t| t == target))
-        .collect();
-    if selected.is_empty() {
-        return Ok(());
-    }
-    match target {
-        "codex" => {
-            let path = dirs_home()?.join(".codex/config.toml");
-            backup_file_preserve(&path)?;
-            install_codex_mcp(&selected)?;
-        }
-        "claude" => {
-            let path = root()?.join(".mcp.json");
-            backup_file_preserve(&path)?;
-            install_claude_mcp(&selected)?;
-        }
-        "cursor" => {
-            let path = root()?.join(".cursor/mcp.json");
-            backup_file_preserve(&path)?;
-            install_json_mcp(&path, &selected, "mcpServers")?;
-        }
-        "windsurf" => {
-            let path = dirs_home()?.join(".codeium/windsurf/mcp_config.json");
-            backup_file_preserve(&path)?;
-            install_json_mcp(&path, &selected, "mcpServers")?;
-        }
-        "gemini" => {
-            let path = root()?.join(".gemini/settings.json");
-            backup_file_preserve(&path)?;
-            install_json_mcp(&path, &selected, "mcpServers")?;
-        }
-        "copilot" => {
-            let path = dirs_home()?.join(".copilot/mcp-config.json");
-            backup_file_preserve(&path)?;
-            install_json_mcp(&path, &selected, "mcpServers")?;
-        }
-        "cline" => {
-            let path = dirs_home()?.join(".cline/mcp.json");
-            backup_file_preserve(&path)?;
-            install_json_mcp(&path, &selected, "mcpServers")?;
-        }
-        "grok" => {
-            let path = root()?.join(".grok/config.toml");
-            backup_file_preserve(&path)?;
-            install_grok_mcp(&selected)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn dirs_home() -> Result<PathBuf> {
-    Ok(BaseDirs::new()
-        .context("cannot find home directory")?
-        .home_dir()
-        .to_path_buf())
-}
-
-fn install_codex_mcp(selected: &[&Mcp]) -> Result<()> {
-    let dirs = BaseDirs::new().context("cannot find home directory")?;
-    let path = dirs.home_dir().join(".codex/config.toml");
-    let mut document = if path.exists() {
-        toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let root = document
-        .as_table_mut()
-        .context("Codex config must be a TOML table")?;
-    let servers = root
-        .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .context("Codex mcp_servers must be a TOML table")?;
-    for mcp in selected {
-        let mut entry = toml::map::Map::new();
-        entry.insert("command".into(), toml::Value::String(mcp.command.clone()));
-        entry.insert(
-            "args".into(),
-            toml::Value::Array(mcp.args.iter().cloned().map(toml::Value::String).collect()),
-        );
-        servers.insert(mcp.name.clone(), toml::Value::Table(entry));
-    }
-    write_atomic(&path, toml::to_string_pretty(&document)?.as_bytes())
-}
-
-fn install_claude_mcp(selected: &[&Mcp]) -> Result<()> {
-    let path = root()?.join(".mcp.json");
-    let mut document = if path.exists() {
-        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path)?)?
-    } else {
-        serde_json::json!({})
-    };
-    let root = document
-        .as_object_mut()
-        .context("Claude config must be a JSON object")?;
-    let servers = root
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("Claude mcpServers must be a JSON object")?;
-    for mcp in selected {
-        servers.insert(
-            mcp.name.clone(),
-            serde_json::json!({"command": mcp.command, "args": mcp.args}),
-        );
-    }
-    write_atomic(&path, serde_json::to_vec_pretty(&document)?.as_slice())
-}
-
-fn install_json_mcp(path: &Path, selected: &[&Mcp], key: &str) -> Result<()> {
-    let mut document = if path.exists() {
-        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path)?)?
-    } else {
-        serde_json::json!({})
-    };
-    let root = document
-        .as_object_mut()
-        .context("MCP config must be a JSON object")?;
-    let servers = root
-        .entry(key)
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("MCP server collection must be a JSON object")?;
-    for mcp in selected {
-        servers.insert(
-            mcp.name.clone(),
-            serde_json::json!({"command": mcp.command, "args": mcp.args}),
-        );
-    }
-    write_atomic(path, serde_json::to_vec_pretty(&document)?.as_slice())
-}
-
-fn install_grok_mcp(selected: &[&Mcp]) -> Result<()> {
-    let path = root()?.join(".grok/config.toml");
-    let mut document = if path.exists() {
-        toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let root = document
-        .as_table_mut()
-        .context("Grok config must be a TOML table")?;
-    let servers = root
-        .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .context("Grok mcp_servers must be a TOML table")?;
-    for mcp in selected {
-        let mut entry = toml::map::Map::new();
-        entry.insert("command".into(), toml::Value::String(mcp.command.clone()));
-        entry.insert(
-            "args".into(),
-            toml::Value::Array(mcp.args.iter().cloned().map(toml::Value::String).collect()),
-        );
-        servers.insert(mcp.name.clone(), toml::Value::Table(entry));
-    }
-    write_atomic(&path, toml::to_string_pretty(&document)?.as_bytes())
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("agentx-tmp");
-    fs::write(&temp, bytes)?;
-    fs::rename(temp, path)?;
-    Ok(())
-}
-
-fn backup_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("managed");
-    path.with_file_name(format!("{name}.agentx-backup"))
-}
-
-fn created_marker_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(
-        "{}.agentx-created",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("managed")
-    ))
-}
-
-fn backup_file(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let backup = backup_path(path);
-    if backup.exists() {
-        remove_path(&backup)?;
-    }
-    fs::rename(path, backup)?;
-    Ok(())
-}
-
-fn backup_file_preserve(path: &Path) -> Result<()> {
-    let existed = path.exists();
-    let marker = created_marker_path(path);
-    if marker.exists() {
-        fs::remove_file(&marker)?;
-    }
-    let contents = if path.is_file() {
-        Some(fs::read(path)?)
-    } else {
-        None
-    };
-    backup_file(path)?;
-    if let Some(contents) = contents {
-        fs::write(path, contents)?;
-    } else if !existed {
-        if let Some(parent) = marker.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(marker, b"")?;
-    }
-    Ok(())
-}
-
-fn remove_path(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn restore_file(path: &Path) -> Result<bool> {
-    let backup = backup_path(path);
-    if !backup.exists() {
-        return Ok(false);
-    }
-    if path.exists() {
-        remove_path(path)?;
-    }
-    fs::rename(backup, path)?;
-    Ok(true)
-}
 fn rollback() -> Result<()> {
-    let mut restored = 0;
-    for target in SUPPORTED_TARGETS {
-        let root = target_root(target)?;
-        if !root.exists() {
-            continue;
-        }
-        for entry in fs::read_dir(&root)? {
-            let path = entry?.path();
-            if path.extension().and_then(|x| x.to_str()) == Some("agentx-backup") {
-                let original = path.with_extension("");
-                if original.exists() {
-                    remove_path(&original)?;
-                }
-                fs::rename(path, original)?;
-                restored += 1;
-            } else if path.extension().and_then(|x| x.to_str()) == Some("agentx-created") {
-                let original = path.with_extension("");
-                if original.exists() {
-                    remove_path(&original)?;
-                }
-                fs::remove_file(path)?;
-                restored += 1;
-            }
-        }
-    }
-    for target in SUPPORTED_TARGETS {
-        for path in managed_rule_paths(target)?
-            .into_iter()
-            .chain(managed_mcp_paths(target)?.into_iter())
-        {
-            if restore_file(&path)? {
-                restored += 1;
-            } else {
-                let marker = created_marker_path(&path);
-                if marker.exists() {
-                    if path.exists() {
-                        remove_path(&path)?;
-                    }
-                    fs::remove_file(marker)?;
-                    restored += 1;
-                }
-            }
-        }
-    }
-    println!("restored {restored} backup(s)");
+    let path = rollback_journal_path()?;
+    let bytes = read_regular_file(&path)?.context("no local installation to roll back")?;
+    let journal: RollbackJournal =
+        serde_json::from_slice(&bytes).context("invalid rollback journal")?;
+    validate_rollback_journal(&journal)?;
+    let restored = journal.entries.len();
+    restore_journal(&journal, &format!("rollback-{}", operation_nonce()?))?;
+    fs::remove_file(path)?;
+    fs::remove_dir_all(&journal.backup_root)?;
+    println!("restored {restored} managed path(s)");
     Ok(())
 }
 
-fn managed_rule_paths(target: &str) -> Result<Vec<PathBuf>> {
-    Ok(match target {
-        "codex" => vec![root()?.join("AGENTS.md")],
-        "claude" => vec![root()?.join("CLAUDE.md")],
-        "cursor" => vec![root()?.join(".cursor/rules/agentx.mdc")],
-        "windsurf" => vec![root()?.join(".windsurf/rules/agentx.md")],
-        "gemini" => vec![root()?.join("GEMINI.md")],
-        "copilot" => vec![root()?.join(".github/copilot-instructions.md")],
-        "cline" => vec![root()?.join(".clinerules/agentx.md")],
-        "grok" => vec![root()?.join(".grok/rules/agentx.md")],
-        _ => bail!("unsupported target {target}"),
-    })
-}
-
-fn managed_mcp_paths(target: &str) -> Result<Vec<PathBuf>> {
-    Ok(match target {
-        "codex" => vec![dirs_home()?.join(".codex/config.toml")],
-        "claude" => vec![root()?.join(".mcp.json")],
-        "cursor" => vec![root()?.join(".cursor/mcp.json")],
-        "windsurf" => vec![dirs_home()?.join(".codeium/windsurf/mcp_config.json")],
-        "gemini" => vec![root()?.join(".gemini/settings.json")],
-        "copilot" => vec![dirs_home()?.join(".copilot/mcp-config.json")],
-        "cline" => vec![dirs_home()?.join(".cline/mcp.json")],
-        "grok" => vec![root()?.join(".grok/config.toml")],
-        _ => bail!("unsupported target {target}"),
-    })
-}
-
-fn managed_rule_path(target: &str) -> Result<PathBuf> {
-    managed_rule_paths(target)?
-        .into_iter()
-        .next()
-        .context("missing managed rule path")
-}
-
-fn install_rules(m: &Manifest, target: &str) -> Result<()> {
-    let mut text = String::new();
-    for rule in &m.rules {
-        if rule.targets.is_empty() || rule.targets.iter().any(|x| x == target) {
-            let p = safe_project_path(&rule.source, "rule source")?;
-            text.push_str(&fs::read_to_string(p)?);
-            text.push_str("\n\n");
-        }
-    }
-    if text.is_empty() {
-        return Ok(());
-    }
-    let path = managed_rule_path(target)?;
-    let existing = if matches!(target, "codex" | "claude") {
-        fs::read_to_string(&path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    backup_file_preserve(&path)?;
-    match target {
-        "codex" | "claude" => {
-            write_atomic(&path, merge_managed_rules(&existing, &text).as_bytes())?;
-        }
-        "cursor" => {
-            let dir = root()?.join(".cursor/rules");
-            fs::create_dir_all(&dir)?;
-            write_atomic(
-                &path,
-                format!(
-                    "---\ndescription: AgentX managed project rules\nalwaysApply: true\n---\n\n{text}"
-                )
-                .as_bytes(),
-            )?;
-        }
-        "windsurf" | "gemini" | "copilot" | "cline" | "grok" => {
-            write_atomic(&path, text.as_bytes())?
-        }
-        _ => bail!("unsupported target {target}"),
-    }
-    Ok(())
-}
-
-const RULES_BEGIN: &str = "<!-- BEGIN AGENTX MANAGED RULES -->";
-const RULES_END: &str = "<!-- END AGENTX MANAGED RULES -->";
-
-fn merge_managed_rules(existing: &str, rules: &str) -> String {
-    let block = format!("{RULES_BEGIN}\n{rules}\n{RULES_END}");
-    if let (Some(start), Some(end)) = (existing.find(RULES_BEGIN), existing.find(RULES_END)) {
-        let end = end + RULES_END.len();
-        let mut merged = String::with_capacity(existing.len() + rules.len());
-        merged.push_str(&existing[..start]);
-        merged.push_str(&block);
-        merged.push_str(&existing[end..]);
-        merged
-    } else if existing.trim().is_empty() {
-        block + "\n"
-    } else {
-        format!("{}\n\n{}\n", existing.trim_end(), block)
-    }
-}
-fn security_scan(path: &Path) -> Result<()> {
-    for entry in WalkDir::new(path).follow_links(false) {
-        let e = entry?;
-        if e.file_type().is_symlink() {
-            bail!(
-                "symlink is not allowed in skill package: {}",
-                e.path().display()
-            );
-        }
-        if e.file_type().is_file() {
-            if e.metadata()?.len() > 2_000_000 {
-                bail!("skill file exceeds 2MB: {}", e.path().display());
-            }
-            if is_forbidden_skill_file(e.path()) {
-                bail!(
-                    "credential or private-key file is not allowed in a skill package: {}",
-                    e.path().display()
-                );
-            }
-            if is_unexpected_executable(e.path())? {
-                bail!(
-                    "native or unexpected executable is not allowed in a skill package: {}",
-                    e.path().display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_forbidden_skill_file(path: &Path) -> bool {
-    let components = path
-        .components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    if components.iter().any(|component| {
-        matches!(
-            component.as_str(),
-            ".git" | ".hg" | ".svn" | ".ssh" | ".aws" | ".azure" | ".kube"
-        )
-    }) {
-        return true;
-    }
-    let Some(name) = components.last() else {
-        return false;
-    };
-    if name == ".env"
-        || name.starts_with(".env.")
-        || matches!(
-            name.as_str(),
-            ".netrc"
-                | ".npmrc"
-                | ".pypirc"
-                | "credentials"
-                | "credentials.json"
-                | "credentials.yaml"
-                | "credentials.yml"
-                | "secrets"
-                | "secrets.json"
-                | "secrets.yaml"
-                | "secrets.yml"
-                | "tokens.json"
-                | "cookies.json"
-                | "session.json"
-                | "sessions.json"
-                | "id_rsa"
-                | "id_dsa"
-                | "id_ecdsa"
-                | "id_ed25519"
-        )
-        || name.contains("private_key")
-        || name.contains("private-key")
-    {
-        return true;
-    }
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("pem" | "key" | "p12" | "pfx" | "jks" | "keystore")
-    )
-}
-
-fn is_unexpected_executable(path: &Path) -> Result<bool> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase);
-    if matches!(
-        extension.as_deref(),
-        Some("exe" | "dll" | "so" | "dylib" | "node" | "wasm")
-    ) {
-        return Ok(true);
-    }
-    let mut header = [0_u8; 8];
-    let mut file = fs::File::open(path)?;
-    let read = file.read(&mut header)?;
-    let bytes = &header[..read];
-    let native_magic = bytes.starts_with(b"\x7fELF")
-        || bytes.starts_with(b"MZ")
-        || bytes.starts_with(b"\0asm")
-        || matches!(
-            bytes.get(..4),
-            Some(
-                [0xfe, 0xed, 0xfa, 0xce]
-                    | [0xfe, 0xed, 0xfa, 0xcf]
-                    | [0xce, 0xfa, 0xed, 0xfe]
-                    | [0xcf, 0xfa, 0xed, 0xfe]
-                    | [0xca, 0xfe, 0xba, 0xbe]
-            )
-        );
-    if native_magic {
-        return Ok(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(path)?.permissions().mode() & 0o111 != 0 && !bytes.starts_with(b"#!") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in WalkDir::new(src).follow_links(false) {
-        let e = entry?;
-        let rel = e.path().strip_prefix(src)?;
-        let out = dst.join(rel);
-        if e.file_type().is_dir() {
-            fs::create_dir_all(&out)?;
-        } else if e.file_type().is_file() {
-            fs::copy(e.path(), &out)?;
-        }
-    }
-    Ok(())
-}
 fn diff(target: Option<&str>) -> Result<()> {
     let m = load_manifest()?;
-    validate_manifest_targets(&m)?;
-    let targets = selected_targets(&m, target)?;
+    let (expected_lock, sources) = resolve_manifest(&m)?;
+    let targets: Vec<_> = match target {
+        Some(value) => {
+            validate_target(value)?;
+            vec![value]
+        }
+        None => SUPPORTED_TARGETS.to_vec(),
+    };
     for target in targets {
-        let dest = target_root(&target)?;
+        let dest = target_root(target)?;
         for skill in &m.skills {
-            if !skill.targets.is_empty() && !skill.targets.iter().any(|x| x == &target) {
+            if !skill.targets.is_empty() && !skill.targets.iter().any(|value| value == target) {
                 continue;
             }
-            let source = source_path(&skill.source)?;
-            security_scan(&source)?;
-            let expected = sha256_dir(&source)?;
+            let expected = sha256_dir(
+                sources
+                    .get(&skill.name)
+                    .context("resolved skill source is missing")?,
+            )?;
             let actual = dest.join(&skill.name);
             if !actual.exists() {
-                println!("{target}: missing skill {}", skill.name);
+                println!("{target}: missing {}", skill.name);
             } else {
                 let got = sha256_dir(&actual)?;
                 println!(
-                    "{target}: skill {} {}",
+                    "{target}: {} {}",
                     skill.name,
                     if got == expected { "ok" } else { "drift" }
                 );
             }
         }
-        let expected_rules = selected_rules(&m, &target)?;
-        if !expected_rules.is_empty() {
-            let path = managed_rule_path(&target)?;
-            let actual = fs::read_to_string(&path).unwrap_or_default();
-            let matches = if matches!(target.as_str(), "codex" | "claude") {
-                actual.contains(&expected_rules)
-            } else if target == "cursor" {
-                actual.contains(&expected_rules)
+        println!(
+            "{target}: rules {}",
+            if planned_rule_change(&m, target)?.is_none() {
+                "ok"
             } else {
-                actual == expected_rules
-            };
-            println!(
-                "{target}: rules {} {}",
-                path.display(),
-                if matches { "ok" } else { "drift/missing" }
-            );
-        }
-        let selected_mcp: Vec<_> = m
-            .mcp
-            .iter()
-            .filter(|server| {
-                server.targets.is_empty() || server.targets.iter().any(|item| item == &target)
-            })
-            .collect();
-        if !selected_mcp.is_empty() {
-            let path = managed_mcp_paths(&target)?
-                .into_iter()
-                .next()
-                .context("missing managed MCP path")?;
-            let matches = mcp_config_matches(&path, &target, &selected_mcp)?;
-            println!(
-                "{target}: MCP {} {}",
-                path.display(),
-                if matches { "ok" } else { "drift/missing" }
-            );
-        }
+                "drift"
+            }
+        );
+        println!(
+            "{target}: MCP {}",
+            if planned_mcp_changes(&m, target)?.is_empty() {
+                "ok"
+            } else {
+                "drift"
+            }
+        );
     }
+    let lock_path = root()?.join("agentx.lock");
+    let lock_ok = read_regular_file(&lock_path)?
+        .and_then(|bytes| serde_yaml::from_slice::<Lock>(&bytes).ok())
+        .is_some_and(|actual| actual == expected_lock);
+    println!("lockfile: {}", if lock_ok { "ok" } else { "drift" });
     Ok(())
-}
-
-fn selected_targets(m: &Manifest, requested: Option<&str>) -> Result<Vec<String>> {
-    if let Some(target) = requested {
-        if !SUPPORTED_TARGETS.contains(&target) {
-            bail!(
-                "unsupported target {target}; use {}",
-                SUPPORTED_TARGETS.join(", ")
-            );
-        }
-        return Ok(vec![target.to_string()]);
-    }
-    let mut targets = vec!["codex".to_string(), "claude".to_string()];
-    for target in m
-        .skills
-        .iter()
-        .flat_map(|item| item.targets.iter())
-        .chain(m.rules.iter().flat_map(|item| item.targets.iter()))
-        .chain(m.mcp.iter().flat_map(|item| item.targets.iter()))
-    {
-        if SUPPORTED_TARGETS.contains(&target.as_str()) && !targets.contains(target) {
-            targets.push(target.clone());
-        }
-    }
-    Ok(targets)
-}
-
-fn selected_rules(m: &Manifest, target: &str) -> Result<String> {
-    let mut text = String::new();
-    for rule in &m.rules {
-        if rule.targets.is_empty() || rule.targets.iter().any(|item| item == target) {
-            let path = safe_project_path(&rule.source, "rule source")?;
-            security_scan(&path)?;
-            text.push_str(&fs::read_to_string(path)?);
-            text.push_str("\n\n");
-        }
-    }
-    Ok(text)
-}
-
-fn mcp_config_matches(path: &Path, target: &str, selected: &[&Mcp]) -> Result<bool> {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(_) => return Ok(false),
-    };
-    if target == "codex" || target == "grok" {
-        let document: toml::Value = toml::from_str(&raw)?;
-        let Some(servers) = document.get("mcp_servers").and_then(toml::Value::as_table) else {
-            return Ok(false);
-        };
-        return Ok(selected.iter().all(|server| {
-            let Some(value) = servers.get(&server.name).and_then(toml::Value::as_table) else {
-                return false;
-            };
-            value.get("command").and_then(toml::Value::as_str) == Some(server.command.as_str())
-                && value
-                    .get("args")
-                    .and_then(toml::Value::as_array)
-                    .map(|args| {
-                        args.iter()
-                            .filter_map(toml::Value::as_str)
-                            .eq(server.args.iter().map(String::as_str))
-                    })
-                    .unwrap_or(false)
-        }));
-    }
-    let document: serde_json::Value = serde_json::from_str(&raw)?;
-    let Some(servers) = document
-        .get("mcpServers")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(false);
-    };
-    Ok(selected.iter().all(|server| {
-        servers.get(&server.name).is_some_and(|value| {
-            value.get("command").and_then(serde_json::Value::as_str)
-                == Some(server.command.as_str())
-                && value
-                    .get("args")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|args| {
-                        args.iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .eq(server.args.iter().map(String::as_str))
-                    })
-                    .unwrap_or(false)
-        })
-    }))
 }
 fn doctor() -> Result<()> {
     for target in SUPPORTED_TARGETS {
-        let cli = target_command(target)
-            .map(|command| {
-                let found = std::process::Command::new("sh")
-                    .args(["-lc", &format!("command -v {command}")])
-                    .output()
-                    .map(|output| output.status.success())
-                    .unwrap_or(false);
-                if found { "available" } else { "not found" }
-            })
-            .unwrap_or("no standalone CLI");
-        let skills = target_root(target)?;
-        let rules = managed_rule_paths(target)?
-            .into_iter()
-            .any(|path| path.exists());
-        let mcp = managed_mcp_paths(target)?
-            .into_iter()
-            .any(|path| path.exists());
+        let bin = target;
+        let found = std::process::Command::new("sh")
+            .args(["-lc", &format!("command -v {bin}")])
+            .output()?
+            .status
+            .success();
+        let configured = target_root(target)?
+            .parent()
+            .map(Path::exists)
+            .unwrap_or(false);
         println!(
-            "{target}: CLI {cli}; project adapter {}",
-            if rules || mcp || skills.exists() {
-                "configured"
+            "{target}: {}",
+            if found || configured {
+                "detected"
             } else {
-                "not configured"
+                "not found"
             }
         );
-        println!("  skills dir: {}", skills.display());
+        println!("  skills dir: {}", target_root(target)?.display());
     }
     Ok(())
-}
-
-fn target_command(target: &str) -> Option<&'static str> {
-    match target {
-        "codex" => Some("codex"),
-        "claude" => Some("claude"),
-        "cursor" => Some("cursor-agent"),
-        "windsurf" => Some("windsurf"),
-        "gemini" => Some("gemini"),
-        "copilot" => Some("gh"),
-        "grok" => Some("grok"),
-        "cline" => None,
-        _ => None,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        domain::RemoteAction,
+        infrastructure::{
+            artifacts::validate_package_path,
+            installer::{RollbackEntry, apply_agent_plan_to, rollback_agent_files_from},
+            targets::RULES_START,
+        },
+    };
+    use flate2::{Compression, GzBuilder};
     use std::fs;
+    use tar::{Builder, Header};
+
+    fn test_archive(path: &str, mode: u32, body: &[u8]) -> Vec<u8> {
+        let encoder = GzBuilder::new()
+            .mtime(0)
+            .write(Vec::new(), Compression::default());
+        let mut archive = Builder::new(encoder);
+        let mut skill = Header::new_gnu();
+        skill.set_size(7);
+        skill.set_mode(0o644);
+        skill.set_cksum();
+        archive
+            .append_data(&mut skill, "SKILL.md", &b"# Demo\n"[..])
+            .unwrap();
+        let mut header = Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        archive.append_data(&mut header, path, body).unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
 
     #[test]
     fn directory_hash_is_deterministic() {
@@ -1723,6 +781,26 @@ mod tests {
     }
 
     #[test]
+    fn directory_hash_frames_paths_and_contents() {
+        let base = std::env::temp_dir().join(format!(
+            "agentx-hash-framing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("a"), "bc").unwrap();
+        fs::write(second.join("ab"), "c").unwrap();
+        assert_ne!(sha256_dir(&first).unwrap(), sha256_dir(&second).unwrap());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn security_scan_rejects_large_files() {
         let dir = std::env::temp_dir().join(format!("agentx-large-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1733,34 +811,54 @@ mod tests {
     }
 
     #[test]
-    fn security_scan_rejects_credentials_and_native_executables() {
-        let credentials =
-            std::env::temp_dir().join(format!("agentx-credentials-{}", std::process::id()));
-        fs::create_dir_all(&credentials).unwrap();
-        fs::write(credentials.join(".env.production"), "TOKEN=secret").unwrap();
-        assert!(security_scan(&credentials).is_err());
-        fs::remove_dir_all(credentials).unwrap();
-
-        let executable =
-            std::env::temp_dir().join(format!("agentx-executable-{}", std::process::id()));
-        fs::create_dir_all(&executable).unwrap();
-        fs::write(executable.join("payload"), b"\x7fELF\x02\x01\x01\0").unwrap();
-        assert!(security_scan(&executable).is_err());
-        fs::remove_dir_all(executable).unwrap();
+    fn skill_archive_is_deterministic_and_rejects_executables() {
+        let dir = std::env::temp_dir().join(format!("agentx-archive-{}", std::process::id()));
+        fs::create_dir_all(dir.join("references")).unwrap();
+        fs::write(dir.join("SKILL.md"), "# Demo\n").unwrap();
+        fs::write(dir.join("references/guide.md"), "guide\n").unwrap();
+        let first = build_skill_archive(&dir).unwrap();
+        let second = build_skill_archive(&dir).unwrap();
+        assert_eq!(first, second);
+        let files = read_skill_archive(&first).unwrap();
+        assert_eq!(files[Path::new("SKILL.md")], b"# Demo\n");
+        let executable = test_archive("run.sh", 0o755, b"exit 0");
+        assert!(read_skill_archive(&executable).is_err());
+        assert!(validate_package_path(Path::new("../secret")).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn environment_references_are_disclosed_without_duplicates() {
-        let mcp = Mcp {
-            name: "docs".into(),
-            command: "sh".into(),
-            args: vec![
-                "-lc".into(),
-                "serve --token $TOKEN --org ${ORG}-$TOKEN".into(),
-            ],
-            targets: vec![],
-        };
-        assert_eq!(environment_references(&mcp), vec!["ORG", "TOKEN"]);
+    fn agent_plan_installs_and_rolls_back_skill_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "agentx-agent-plan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let destination = base.join("target");
+        let staging = base.join("staging");
+        fs::create_dir_all(destination.join("demo")).unwrap();
+        fs::create_dir_all(staging.join("demo")).unwrap();
+        fs::write(destination.join("demo/SKILL.md"), "# Old\n").unwrap();
+        fs::write(staging.join("demo/SKILL.md"), "# New\n").unwrap();
+        let actions = vec![RemoteAction {
+            package: "demo".into(),
+            kind: "update".into(),
+            to: "digest".into(),
+        }];
+        apply_agent_plan_to(&destination, &actions, &staging).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("demo/SKILL.md")).unwrap(),
+            "# New\n"
+        );
+        rollback_agent_files_from(&destination, &["demo".into()]).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("demo/SKILL.md")).unwrap(),
+            "# Old\n"
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -1785,44 +883,75 @@ mod tests {
 
     #[test]
     fn json_mcp_adapter_preserves_existing_servers() {
-        let path = std::env::temp_dir().join(format!("agentx-mcp-{}.json", std::process::id()));
-        fs::write(
-            &path,
-            r#"{"mcpServers":{"existing":{"command":"keep"}},"other":true}"#,
-        )
-        .unwrap();
+        let existing = br#"{"mcpServers":{"existing":{"command":"keep"}},"other":true}"#;
         let mcp = Mcp {
             name: "docs".into(),
             command: "npx".into(),
             args: vec!["-y".into(), "docs-mcp".into()],
             targets: vec![],
         };
-        install_json_mcp(&path, &[&mcp], "mcpServers").unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let bytes = render_mcp_native("cursor", Some(existing), &BTreeSet::new(), &[&mcp]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["other"], true);
         assert_eq!(value["mcpServers"]["existing"]["command"], "keep");
         assert_eq!(value["mcpServers"]["docs"]["command"], "npx");
-        fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn project_paths_and_names_reject_traversal() {
-        assert!(safe_project_path("../outside", "source").is_err());
-        assert!(safe_project_path("/tmp/outside", "source").is_err());
-        assert!(safe_name("../outside", "skill").is_err());
-        assert!(safe_name("nested/name", "skill").is_err());
-        assert!(safe_name(".", "skill").is_err());
+    fn managed_rules_preserve_user_text() {
+        let first = render_managed_rules("# User\n", "# Team").unwrap();
+        assert!(first.starts_with("# User\n\n"));
+        let second = render_managed_rules(&first, "# Updated").unwrap();
+        assert!(second.starts_with("# User\n\n"));
+        assert!(second.contains("# Updated"));
+        assert!(!second.contains("# Team"));
+        let removed = render_managed_rules(&second, "").unwrap();
+        assert!(removed.contains("# User"));
+        assert!(!removed.contains(RULES_START));
     }
 
     #[test]
-    fn managed_rules_preserve_user_content_and_replace_block() {
-        let first = merge_managed_rules("# User rules\n", "# AgentX rules\n");
-        assert!(first.starts_with("# User rules"));
-        assert!(first.contains(RULES_BEGIN));
-        let second = merge_managed_rules(&first, "# Updated rules\n");
-        assert!(second.contains("# User rules"));
-        assert!(second.contains("# Updated rules"));
-        assert!(!second.contains("# AgentX rules"));
+    fn failed_plan_can_restore_every_applied_change() {
+        let base = std::env::temp_dir().join(format!(
+            "agentx-plan-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let first = base.join("first.txt");
+        let backup = base.join("backup.txt");
+        fs::write(&first, "old").unwrap();
+        fs::write(&backup, "old").unwrap();
+        let blocker = base.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let plan = vec![
+            PlannedChange {
+                destination: first.clone(),
+                content: PlannedContent::File(b"new".to_vec()),
+                description: "first".into(),
+            },
+            PlannedChange {
+                destination: blocker.join("second.txt"),
+                content: PlannedContent::File(b"never written".to_vec()),
+                description: "second".into(),
+            },
+        ];
+        let journal = RollbackJournal {
+            version: 1,
+            backup_root: base.clone(),
+            entries: vec![RollbackEntry {
+                destination: first.clone(),
+                backup: Some(backup),
+                directory: false,
+            }],
+        };
+        assert!(apply_install_plan(&plan, &[], "test").is_err());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "new");
+        restore_journal(&journal, "test-restore").unwrap();
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old");
+        fs::remove_dir_all(base).unwrap();
     }
 }

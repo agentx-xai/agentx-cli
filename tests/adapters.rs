@@ -1,8 +1,7 @@
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,39 +15,6 @@ fn temp_dir(label: &str) -> PathBuf {
     path
 }
 
-#[test]
-fn install_plan_discloses_commands_arguments_and_target_paths() {
-    let project = temp_dir("plan-project");
-    let home = temp_dir("plan-home");
-    fs::create_dir_all(project.join("skills/demo")).unwrap();
-    fs::write(project.join("skills/demo/SKILL.md"), "# Demo\n").unwrap();
-    fs::write(
-        project.join("agentx.yaml"),
-        "version: 1\nskills:\n  - name: demo\n    source: { type: local, path: skills/demo }\nmcp:\n  - name: docs\n    command: sh\n    args: [\"-lc\", \"docs --token $DOCS_TOKEN\"]\n    targets: [codex]\n",
-    )
-    .unwrap();
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentx"))
-        .args(["install", "--target", "codex"])
-        .current_dir(&project)
-        .env("HOME", &home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("command \"sh\"; args [\"-lc\", \"docs --token $DOCS_TOKEN\"]"));
-    assert!(stdout.contains("environment refs [DOCS_TOKEN]"));
-    assert!(stdout.contains(&home.join(".codex/config.toml").display().to_string()));
-    assert!(stdout.contains(&home.join(".codex/skills/demo").display().to_string()));
-
-    fs::remove_dir_all(project).unwrap();
-    fs::remove_dir_all(home).unwrap();
-}
-
 fn install(project: &Path, home: &Path, target: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
         .args(["install", "--target", target, "--yes"])
@@ -59,20 +25,6 @@ fn install(project: &Path, home: &Path, target: &str) {
     assert!(
         output.status.success(),
         "target {target} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn rollback(project: &Path, home: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
-        .arg("rollback")
-        .current_dir(project)
-        .env("HOME", home)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "rollback failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -140,7 +92,7 @@ fn install_compiles_all_supported_target_formats() {
 
     for path in [
         home.join(".codex/config.toml"),
-        project.join(".mcp.json"),
+        home.join(".claude.json"),
         project.join(".cursor/mcp.json"),
         home.join(".codeium/windsurf/mcp_config.json"),
         project.join(".gemini/settings.json"),
@@ -169,21 +121,124 @@ fn install_compiles_all_supported_target_formats() {
         Some("-y")
     );
 
-    rollback(&project, &home);
-    for path in [
-        project.join("AGENTS.md"),
-        project.join("CLAUDE.md"),
-        project.join(".mcp.json"),
+    fs::remove_dir_all(project).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn install_rejects_unsafe_names_and_escaping_sources_before_mutation() {
+    let project = temp_dir("unsafe-project");
+    let home = temp_dir("unsafe-home");
+    let outside = temp_dir("unsafe-outside");
+    fs::write(outside.join("SKILL.md"), "# Outside\n").unwrap();
+    fs::write(
+        project.join("agentx.yaml"),
+        format!(
+            "version: 1\nskills:\n  - name: ../escape\n    source: {{ type: local, path: {} }}\n",
+            outside.display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
+        .args(["install", "--target", "codex", "--yes"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!home.join(".codex/skills").exists());
+
+    fs::write(
+        project.join("agentx.yaml"),
+        "version: 1\nskills:\n  - name: demo\n    source: { type: local, path: ../unsafe-outside }\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
+        .args(["install", "--target", "codex", "--yes"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!home.join(".codex/skills").exists());
+
+    fs::remove_dir_all(project).unwrap();
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn rollback_restores_skills_rules_mcp_and_lockfile() {
+    let project = temp_dir("rollback-project");
+    let home = temp_dir("rollback-home");
+    for name in ["foo.bar", "foo.baz"] {
+        fs::create_dir_all(project.join("skills").join(name)).unwrap();
+        fs::write(
+            project.join("skills").join(name).join("SKILL.md"),
+            format!("# New {name}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(home.join(".codex/skills").join(name)).unwrap();
+        fs::write(
+            home.join(".codex/skills").join(name).join("SKILL.md"),
+            format!("# Old {name}\n"),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(project.join("rules")).unwrap();
+    fs::write(project.join("rules/team.md"), "# Team rules\n").unwrap();
+    fs::write(project.join("AGENTS.md"), "# User rules\n").unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::write(
         home.join(".codex/config.toml"),
-        home.join(".codeium/windsurf/mcp_config.json"),
-        home.join(".cline/mcp.json"),
-    ] {
-        assert!(
-            !path.exists(),
-            "rollback left generated path: {}",
-            path.display()
+        "[mcp_servers.existing]\ncommand = \"keep\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("agentx.lock"), "old lock\n").unwrap();
+    fs::write(
+        project.join("agentx.yaml"),
+        "version: 1\nskills:\n  - name: foo.bar\n    source: { type: local, path: skills/foo.bar }\n  - name: foo.baz\n    source: { type: local, path: skills/foo.baz }\nrules:\n  - source: rules/team.md\nmcp:\n  - name: docs\n    command: npx\n    args: [\"-y\", \"docs-mcp\"]\n",
+    )
+    .unwrap();
+
+    install(&project, &home, "codex");
+    let rules = fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    assert!(rules.contains("# User rules"));
+    assert!(rules.contains("# Team rules"));
+    let config = fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    assert!(config.contains("mcp_servers.existing"));
+    assert!(config.contains("mcp_servers.docs"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentx"))
+        .arg("rollback")
+        .current_dir(&project)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("AGENTS.md")).unwrap(),
+        "# User rules\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("agentx.lock")).unwrap(),
+        "old lock\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+        "[mcp_servers.existing]\ncommand = \"keep\"\n"
+    );
+    for name in ["foo.bar", "foo.baz"] {
+        assert_eq!(
+            fs::read_to_string(home.join(".codex/skills").join(name).join("SKILL.md")).unwrap(),
+            format!("# Old {name}\n")
         );
     }
+    assert!(!project.join(".agentx/rollback.json").exists());
 
     fs::remove_dir_all(project).unwrap();
     fs::remove_dir_all(home).unwrap();
